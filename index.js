@@ -223,6 +223,74 @@ app.get('/api/data', (req, res) => {
   res.json({ customers: Object.values(db.customers).sort((a,b) => new Date(b.lastContact)-new Date(a.lastContact)), pendingReplies: db.pendingReplies });
 });
 
+// ── Outbound call: Kyle's phone rings first, then bridges to customer ─────────
+app.post('/api/call', async (req, res) => {
+  try {
+    const { customerPhone, fromNumber } = req.body;
+    if (!customerPhone || !fromNumber) return res.status(400).json({ error: 'Missing params' });
+    const call = await twilioClient.calls.create({
+      to: KYLE_PHONE, from: fromNumber,
+      url: req.protocol + '://' + req.get('host') + '/webhook/call-bridge?customerPhone=' + encodeURIComponent(customerPhone) + '&fromNumber=' + encodeURIComponent(fromNumber)
+    });
+    res.json({ ok: true, callSid: call.sid, message: 'Your phone is ringing — answer to connect to customer' });
+  } catch (err) { console.error('Call error:', err); res.status(500).json({ error: err.message }); }
+});
+
+app.post('/webhook/call-bridge', (req, res) => {
+  const customerPhone = req.query.customerPhone;
+  const fromNumber = req.query.fromNumber;
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'Polly.Joanna' }, 'Connecting you to your customer now.');
+  const dial = twiml.dial({ callerId: fromNumber, timeout: 30 });
+  dial.number(customerPhone);
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/api/new-sms', async (req, res) => {
+  try {
+    const { toPhone, body, fromNumber } = req.body;
+    if (!toPhone || !body || !fromNumber) return res.status(400).json({ error: 'Missing params' });
+    let phone = toPhone.replace(/\D/g,'');
+    if (phone.length === 10) phone = '+1' + phone;
+    else if (!phone.startsWith('+')) phone = '+' + phone;
+    const isRoof = fromNumber === ROOF_NUMBER;
+    const businessLine = isRoof ? '🏠 ROOF (352)' : '💡 LIGHTS (321)';
+    const db = loadDB();
+    if (!db.customers[phone]) {
+      db.customers[phone] = { phone, name: null, line: businessLine, firstContact: new Date().toISOString(), lastContact: new Date().toISOString(), messages: [] };
+    }
+    await sendToCustomer(phone, fromNumber, body, db);
+    broadcastSSE({ type: 'reply_sent', customerPhone: phone });
+    res.json({ ok: true, phone });
+  } catch (err) { console.error('New SMS error:', err); res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/new-call', async (req, res) => {
+  try {
+    const { toPhone, fromNumber } = req.body;
+    if (!toPhone || !fromNumber) return res.status(400).json({ error: 'Missing params' });
+    let phone = toPhone.replace(/\D/g,'');
+    if (phone.length === 10) phone = '+1' + phone;
+    else if (!phone.startsWith('+')) phone = '+' + phone;
+    const isRoof = fromNumber === ROOF_NUMBER;
+    const businessLine = isRoof ? '🏠 ROOF (352)' : '💡 LIGHTS (321)';
+    const db = loadDB();
+    if (!db.customers[phone]) {
+      db.customers[phone] = { phone, name: null, line: businessLine, firstContact: new Date().toISOString(), lastContact: new Date().toISOString(), messages: [] };
+    }
+    db.customers[phone].messages.push({ direction: 'out', body: '📞 Outbound call initiated', mediaUrl: null, timestamp: new Date().toISOString(), read: true });
+    db.customers[phone].lastContact = new Date().toISOString();
+    saveDB(db);
+    const call = await twilioClient.calls.create({
+      to: KYLE_PHONE, from: fromNumber,
+      url: req.protocol + '://' + req.get('host') + '/webhook/call-bridge?customerPhone=' + encodeURIComponent(phone) + '&fromNumber=' + encodeURIComponent(fromNumber)
+    });
+    broadcastSSE({ type: 'reply_sent', customerPhone: phone });
+    res.json({ ok: true, callSid: call.sid, phone, message: 'Your phone is ringing — answer to connect' });
+  } catch (err) { console.error('New call error:', err); res.status(500).json({ error: err.message }); }
+});
+
+
 app.post('/api/send', async (req, res) => {
   try {
     const { customerPhone, body, pendingId, mediaUrl } = req.body;
@@ -398,6 +466,28 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
 .install-banner{margin:0 16px 8px;background:var(--surf2);border:1px solid var(--grn);border-radius:10px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;font-size:13px}
 .install-banner.gone{display:none}
 .ibtn{background:var(--grn);color:#000;border:none;border-radius:8px;padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.bcall{background:var(--grn);color:#000;border:none;border-radius:8px;padding:5px 10px;font-size:16px;cursor:pointer;flex-shrink:0}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;display:none}
+.modal-bg.on{display:block}
+.modal{position:fixed;bottom:0;left:0;right:0;background:var(--surf);border-radius:20px 20px 0 0;z-index:101;padding:20px;padding-bottom:max(20px,env(safe-area-inset-bottom));display:none;max-height:85dvh;overflow-y:auto}
+.modal.on{display:block}
+.modal-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.modal-title{font-size:18px;font-weight:700;color:var(--wht)}
+.modal-close{background:var(--surf2);border:none;border-radius:50%;width:30px;height:30px;color:var(--txt);cursor:pointer;font-size:14px}
+.modal-body{display:flex;flex-direction:column;gap:12px}
+.mlbl{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+.line-picker{display:flex;gap:8px}
+.lpick{flex:1;padding:10px;background:var(--surf2);border:1px solid var(--bdr);border-radius:10px;color:var(--txt);cursor:pointer;font-size:14px}
+.lpick.on{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:700}
+.minput{background:var(--surf2);border:1px solid var(--bdr);border-radius:10px;padding:12px;color:var(--txt);font-size:16px;font-family:inherit}
+.minput:focus{outline:none;border-color:var(--acc)}
+.mta{background:var(--surf2);border:1px solid var(--bdr);border-radius:10px;padding:12px;color:var(--txt);font-size:14px;font-family:inherit;resize:none}
+.mta:focus{outline:none;border-color:var(--acc)}
+.modal-actions{display:flex;gap:8px}
+.mbsms,.mbcall{flex:1;padding:10px;background:var(--surf2);border:1px solid var(--bdr);border-radius:10px;color:var(--txt);cursor:pointer;font-size:14px}
+.mbsms.on{background:rgba(108,99,255,.2);border-color:var(--acc)}
+.mbcall.on{background:rgba(0,212,170,.2);border-color:var(--grn)}
+.msubmit{padding:14px;background:var(--acc);border:none;border-radius:12px;color:#fff;font-size:16px;font-weight:700;cursor:pointer}
 </style>
 </head>
 <body>
@@ -436,6 +526,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
     </div>
     <input class="ename" id="ename" placeholder="Name…" onkeydown="if(event.key==='Enter')saveName()">
     <button class="bsname" onclick="saveName()">Save</button>
+    <button class="bcall" onclick="callCustomer()" title="Call customer">📞</button>
   </div>
   <div class="msgs" id="msgs"></div>
   <div class="rbox">
@@ -452,9 +543,37 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSys
   </div>
 </div>
 
+<!-- COMPOSE MODAL -->
+<div class="modal-bg" id="modalBg" onclick="closeCompose()"></div>
+<div class="modal" id="composeModal">
+  <div class="modal-hdr">
+    <span class="modal-title" id="modalTitle">New Message</span>
+    <button class="modal-close" onclick="closeCompose()">✕</button>
+  </div>
+  <div class="modal-body">
+    <label class="mlbl">From number</label>
+    <div class="line-picker">
+      <button class="lpick on" id="lpRoof" onclick="pickLine('roof')">🏠 Roof (352)</button>
+      <button class="lpick" id="lpLights" onclick="pickLine('lights')">💡 Lights (321)</button>
+    </div>
+    <label class="mlbl">To (phone number)</label>
+    <input class="minput" id="composeTo" type="tel" placeholder="(352) 555-1234">
+    <div id="composeTextSection">
+      <label class="mlbl">Message</label>
+      <textarea class="mta" id="composeMsg" placeholder="Type your message…" rows="4"></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="mbsms" id="mbSms" onclick="switchCompose('sms')" style="font-weight:700">💬 Text</button>
+      <button class="mbcall" id="mbCall" onclick="switchCompose('call')">📞 Call</button>
+    </div>
+    <button class="msubmit" id="mSubmit" onclick="submitCompose()">Send Message</button>
+  </div>
+</div>
+
 <div class="bnav">
   <button class="navb on" id="nb1" onclick="goBack()">💬<span class="nlbl">Inbox</span><span class="nbdg" id="pbdg" style="display:none"></span></button>
   <button class="navb" id="nb2">👥<span class="nlbl">Customers</span></button>
+  <button class="navb" onclick="openCompose()">✏️<span class="nlbl">Compose</span></button>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -675,6 +794,75 @@ function esc(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace
 function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';}
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),2500);}
 const ROOF_NUMBER='${ROOF_NUMBER}';
+
+// ── Call customer from conversation ──────────────────────────────────────────
+async function callCustomer(){
+  if(!curPhone)return;
+  const c=data.customers.find(x=>x.phone===curPhone);
+  if(!c)return;
+  const fromNumber=c.line.includes('ROOF')?ROOF_NUMBER:LIGHTS_NUMBER;
+  toast('📞 Calling your phone…');
+  try{
+    const r=await fetch('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerPhone:curPhone,fromNumber})});
+    const d=await r.json();
+    if(d.ok)toast('📞 Answer your phone to connect!');
+    else toast('Call failed: '+d.error);
+  }catch(e){toast('Call error');}
+}
+
+// ── Compose modal ─────────────────────────────────────────────────────────────
+let composeMode='sms';let composeLine=ROOF_NUMBER;
+
+function openCompose(){
+  document.getElementById('modalBg').classList.add('on');
+  document.getElementById('composeModal').classList.add('on');
+  document.getElementById('composeTo').value='';
+  document.getElementById('composeMsg').value='';
+  composeMode='sms';composeLine=ROOF_NUMBER;
+  pickLine('roof');switchCompose('sms');
+  setTimeout(()=>document.getElementById('composeTo').focus(),100);
+}
+function closeCompose(){
+  document.getElementById('modalBg').classList.remove('on');
+  document.getElementById('composeModal').classList.remove('on');
+}
+function pickLine(line){
+  composeLine=line==='roof'?ROOF_NUMBER:LIGHTS_NUMBER;
+  document.getElementById('lpRoof').classList.toggle('on',line==='roof');
+  document.getElementById('lpLights').classList.toggle('on',line==='lights');
+}
+function switchCompose(mode){
+  composeMode=mode;
+  document.getElementById('mbSms').classList.toggle('on',mode==='sms');
+  document.getElementById('mbCall').classList.toggle('on',mode==='call');
+  document.getElementById('composeTextSection').style.display=mode==='sms'?'flex':'none';
+  document.getElementById('composeTextSection').style.flexDirection='column';
+  document.getElementById('composeTextSection').style.gap='8px';
+  document.getElementById('mSubmit').textContent=mode==='sms'?'Send Message':'Start Call';
+}
+async function submitCompose(){
+  const to=document.getElementById('composeTo').value.trim();
+  if(!to){toast('Enter a phone number');return;}
+  const btn=document.getElementById('mSubmit');
+  btn.textContent='Sending…';btn.disabled=true;
+  try{
+    if(composeMode==='sms'){
+      const msg=document.getElementById('composeMsg').value.trim();
+      if(!msg){toast('Enter a message');btn.textContent='Send Message';btn.disabled=false;return;}
+      const r=await fetch('/api/new-sms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toPhone:to,body:msg,fromNumber:composeLine})});
+      const d=await r.json();
+      if(d.ok){closeCompose();await pull();render();openConv(d.phone);toast('Message sent ✓');}
+      else toast('Error: '+d.error);
+    } else {
+      const r=await fetch('/api/new-call',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toPhone:to,fromNumber:composeLine})});
+      const d=await r.json();
+      if(d.ok){closeCompose();toast('📞 Answer your phone to connect!');await pull();render();}
+      else toast('Error: '+d.error);
+    }
+  }catch(e){toast('Error: '+e.message);}
+  btn.disabled=false;
+  btn.textContent=composeMode==='sms'?'Send Message':'Start Call';
+}
 
 boot();
 </script>
