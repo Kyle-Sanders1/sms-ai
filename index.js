@@ -41,7 +41,7 @@ async function getAISuggestion(customerPhone, messageBody, businessLine, db) {
 
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 300,
       messages: [{ role: 'user', content: `You are an AI assistant for Kyle who owns:
 1. Roof Revival LLC - roofing (free inspections, replacements, repairs, estimates in FL)
@@ -139,7 +139,10 @@ app.post('/webhook/inbound', async (req, res) => {
     db.customers[fromPhone].lastContact = new Date().toISOString();
     saveDB(db);
 
-    const ai = await getAISuggestion(fromPhone, body, businessLine, db);
+    // Get AI suggestion — never crash the webhook if AI fails
+    let ai = { intent: 'other', suggestedReply: 'Hi! Thanks for reaching out. How can I help you today?', priority: 'normal' };
+    try { ai = await getAISuggestion(fromPhone, body, businessLine, db); } catch(e) { console.error('AI error:', e.message); }
+
     const pendingId = `${fromPhone.replace(/\D/g,'')}-${Date.now()}`;
     const freshDB = loadDB();
     freshDB.pendingReplies[pendingId] = {
@@ -161,6 +164,57 @@ app.post('/webhook/inbound', async (req, res) => {
     });
     schedulePendingSend(pendingId);
   } catch (err) { console.error('Inbound error:', err); }
+});
+
+// ── Voice call forwarding ────────────────────────────────────────────────────
+app.post('/webhook/voice', (req, res) => {
+  const toNumber = req.body.To;
+  const isRoof = toNumber === ROOF_NUMBER;
+  const businessName = isRoof ? 'Roof Revival LLC' : 'Christmas Lights Installers';
+  const twiml = new twilio.twiml.VoiceResponse();
+  const dial = twiml.dial({
+    timeout: 20,
+    action: '/webhook/voice-fallback?business=' + encodeURIComponent(businessName),
+    method: 'POST',
+    callerId: toNumber
+  });
+  dial.number(KYLE_PHONE);
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/webhook/voice-fallback', (req, res) => {
+  const business = req.query.business || 'our company';
+  const dialStatus = req.body.DialCallStatus;
+  const twiml = new twilio.twiml.VoiceResponse();
+  if (dialStatus === 'completed') { res.type('text/xml').send(twiml.toString()); return; }
+  twiml.say({ voice: 'Polly.Joanna', language: 'en-US' },
+    'Thank you for calling ' + business + '. We are sorry we missed your call. Please leave your name and number and we will get back to you shortly. You can also text this number for a faster response.');
+  twiml.record({ maxLength: 60, transcribe: true, transcribeCallback: '/webhook/voicemail-transcription', playBeep: true, action: '/webhook/voicemail-done' });
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/webhook/voicemail-done', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'Polly.Joanna' }, 'Thank you for your message. We look forward to speaking with you soon. Goodbye!');
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/webhook/voicemail-transcription', async (req, res) => {
+  try {
+    const transcription = req.body.TranscriptionText;
+    const from = req.body.From;
+    const recordingUrl = req.body.RecordingUrl;
+    const db = loadDB();
+    if (!db.customers[from]) {
+      db.customers[from] = { phone: from, name: null, line: 'Unknown', firstContact: new Date().toISOString(), lastContact: new Date().toISOString(), messages: [] };
+    }
+    const vmText = '📞 VOICEMAIL: "' + (transcription || '(no transcription)') + '"';
+    db.customers[from].messages.push({ direction: 'in', body: vmText, mediaUrl: recordingUrl || null, timestamp: new Date().toISOString(), read: false, isVoicemail: true });
+    db.customers[from].lastContact = new Date().toISOString();
+    saveDB(db);
+    broadcastSSE({ type: 'new_message', customerPhone: from, message: vmText, isVoicemail: true });
+  } catch(e) { console.error('Voicemail error:', e); }
+  res.sendStatus(200);
 });
 
 // API routes
