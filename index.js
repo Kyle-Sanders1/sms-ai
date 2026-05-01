@@ -58,21 +58,66 @@ async function getAISuggestion(customerPhone, messageBody, businessLine, db) {
     `${m.direction === 'in' ? 'Customer' : 'Kyle'}: ${m.body || '(media)'}`
   ).join('\n');
 
-  const systemPrompt = `You are drafting SMS replies on behalf of Kyle, owner of two businesses in Florida:
+  // ╔═══════════════════════════════════════════════════════════════════════╗
+  // ║  AI TRAINING EXAMPLES - EDIT THESE TO TRAIN HOW THE AI RESPONDS       ║
+  // ║  Add real examples of how Kyle typically replies in different scenarios║
+  // ╚═══════════════════════════════════════════════════════════════════════╝
+  const trainingExamples = `
+Example interactions showing Kyle's tone and style:
+
+ROOFING EXAMPLES:
+Customer: "Hey is this the roofing company?"
+Kyle: "Hey! Yes, this is Kyle with Roof Revival. Are you looking for an estimate or do you have a leak you need looked at?"
+
+Customer: "I have a leak in my ceiling, can someone come check it out?"
+Kyle: "Sorry to hear that — happy to come take a look. What's your address and is there a day this week that works for you?"
+
+Customer: "How much for a full roof replacement?"
+Kyle: "Depends on size and material, but I can get you a free no-pressure estimate. What's the address and roughly how old is the current roof?"
+
+Customer: "Saw your sign in the neighborhood"
+Kyle: "Awesome, thanks for reaching out! We've been doing a lot of work in the area. Are you having any roof issues, or just thinking about an inspection?"
+
+CHRISTMAS LIGHTS EXAMPLES:
+Customer: "Do you guys still install Christmas lights?"
+Kyle: "We sure do! Are you looking for a quote on your home? If so, what's the address and roughly the size of the house?"
+
+Customer: "How much for lights on a 2-story house?"
+Kyle: "It varies based on roofline and trees, but typical 2-story homes run $600-1200 installed (lights included, takedown in January). Want me to swing by for a free quote?"
+
+Customer: "Need lights down"
+Kyle: "Got it — what's your address and any day next week work for takedown?"
+
+GENERAL TONE:
+- Friendly and human, like a contractor texting back from his truck
+- Skip greetings on follow-up messages — just answer
+- Never use "I'd be happy to" or corporate phrases
+- Use contractions (we're, I'll, that's)
+- Ask one question max per message
+- If customer is hostile/upset: acknowledge first, offer to call them
+`;
+
+  const systemPrompt = `You are drafting SMS replies AS Kyle (do not announce yourself as an assistant).
+Kyle owns two businesses in Florida:
 1. Roof Revival LLC - roofing (free inspections, replacements, repairs, estimates)
 2. Christmas Lights Installers - holiday lighting install/removal
 
-The customer texted the ${businessLine} line.
+Current customer texted the ${businessLine} line.
 Customer name: ${customerName}
 ${isNew ? 'This is a brand NEW customer with no prior conversation.' : `Conversation so far (most recent at bottom):\n${historyText}`}
 
-Your job: Draft a warm, professional, conversational reply as Kyle (2 sentences max). Reference past context when it exists. End with a clear next step or question. Never sound like a bot. Never mention AI.
+${trainingExamples}
 
-For roofing: free inspections, ask address/preferred time
-For lights: ask install date, home size, removal date
+YOUR TASK: Draft Kyle's next reply. Match his tone exactly — warm, casual, contractor-style, 1-2 short sentences. Reference past context when relevant. End with a question or clear next step UNLESS the conversation is wrapping up.
 
-Respond with ONLY valid JSON (no markdown, no code fences):
-{"intent": "new_inquiry|appointment_request|quote_request|existing_followup|complaint|other", "suggestedReply": "your draft reply here", "priority": "high|normal|low"}`;
+NEVER:
+- Say "I'd be happy to" or "Thank you for reaching out"
+- Use corporate/formal language
+- Mention you're an AI
+- Start with "Hi [name]" if there's already conversation history
+
+ALWAYS respond with ONLY valid JSON (no markdown, no code fences):
+{"intent": "new_inquiry|appointment_request|quote_request|existing_followup|complaint|other", "suggestedReply": "your draft", "priority": "high|normal|low"}`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
@@ -283,12 +328,34 @@ app.post('/api/call', async (req, res) => {
 });
 
 app.all('/webhook/call-bridge', (req, res) => {
-  const to = req.query.to;
-  const from = req.query.from;
+  // Phone numbers come from query string; + can become a space, decode/clean it
+  let to = (req.query.to || req.body?.to || '').toString().trim().replace(/\s/g, '+');
+  let from = (req.query.from || req.body?.from || '').toString().trim().replace(/\s/g, '+');
+
+  // Strip any non-phone chars except leading +, ensure E.164
+  to = to.replace(/[^+\d]/g, '');
+  from = from.replace(/[^+\d]/g, '');
+  if (!to.startsWith('+')) to = '+' + to;
+  if (!from.startsWith('+')) from = '+' + from;
+
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, 'Connecting you to your customer now.');
-  const dial = twiml.dial({ callerId: from, timeout: 30 });
+  // hangupOnStar=false, action handler ensures call ends cleanly
+  const dial = twiml.dial({
+    callerId: from,
+    timeout: 30,
+    answerOnBridge: true,
+    action: '/webhook/call-bridge-done',
+    method: 'POST'
+  });
   dial.number(to);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// When the bridged call ends, hang up both legs cleanly
+app.all('/webhook/call-bridge-done', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.hangup();
   res.type('text/xml').send(twiml.toString());
 });
 
