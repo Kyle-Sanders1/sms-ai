@@ -35,57 +35,91 @@ function saveDB(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
+
+// ── Real-time updates via Server-Sent Events ─────────────────────────────────
+const sseClients = new Set();
+function broadcastSSE(payload) {
+  const msg = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(msg); } catch { sseClients.delete(client); }
+  }
+}
+
 // ── AI: classify + suggest ───────────────────────────────────────────────────
 async function getAISuggestion(customerPhone, messageBody, businessLine, db) {
   const customer = db.customers[customerPhone];
-  const history  = customer ? customer.messages.slice(-6) : [];
-  const isNew    = !customer;
+  // Pull last 10 exchanges (excluding the current incoming message which was just saved)
+  const allMsgs = customer ? customer.messages : [];
+  const history = allMsgs.slice(0, -1).slice(-10); // exclude current message
+  const isNew = history.length === 0;
+  const customerName = customer?.name || 'unknown';
 
   const historyText = history.map(m =>
-    `${m.direction === 'in' ? 'Customer' : 'Kyle'}: ${m.body}`
+    `${m.direction === 'in' ? 'Customer' : 'Kyle'}: ${m.body || '(media)'}`
   ).join('\n');
 
-  const systemPrompt = `You are an AI assistant helping Kyle, who owns two businesses:
-1. Roof Revival LLC - roofing company (inspections, replacements, repairs, free estimates)
-2. Christmas Lights Installers - holiday lighting installation/removal service
+  const systemPrompt = `You are drafting SMS replies on behalf of Kyle, owner of two businesses in Florida:
+1. Roof Revival LLC - roofing (free inspections, replacements, repairs, estimates)
+2. Christmas Lights Installers - holiday lighting install/removal
 
 The customer texted the ${businessLine} line.
-${isNew ? 'This is a NEW customer - no prior history.' : `This customer has messaged before. Recent history:\n${historyText}`}
+Customer name: ${customerName}
+${isNew ? 'This is a brand NEW customer with no prior conversation.' : `Conversation so far (most recent at bottom):\n${historyText}`}
 
-Your job:
-1. Identify intent: new inquiry, appointment request, quote request, existing customer follow-up, complaint, etc.
-2. Draft a warm, professional, concise reply (2-3 sentences max) as Kyle
-3. Keep it conversational, not corporate
+Your job: Draft a warm, professional, conversational reply as Kyle (2 sentences max). Reference past context when it exists. End with a clear next step or question. Never sound like a bot. Never mention AI.
 
-Rules:
-- For roofing: offer free inspection/estimate, mention Roof Revival LLC
-- For lights: ask about install date needed, size of home, mention Christmas Lights Installers
-- For appointments: try to get their address and preferred time
-- For existing customers: reference context if available
-- Always end with a question or clear next step
-- Never mention you're an AI
+For roofing: free inspections, ask address/preferred time
+For lights: ask install date, home size, removal date
 
-Respond with ONLY a JSON object like:
-{"intent": "new_inquiry|appointment_request|quote_request|existing_followup|complaint|other", "suggestedReply": "the reply text", "priority": "high|normal|low"}`;
+Respond with ONLY valid JSON (no markdown, no code fences):
+{"intent": "new_inquiry|appointment_request|quote_request|existing_followup|complaint|other", "suggestedReply": "your draft reply here", "priority": "high|normal|low"}`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
-    max_tokens: 300,
+    max_tokens: 400,
     system: systemPrompt,
-    messages: [{ role: 'user', content: `Customer message: "${messageBody}"` }]
+    messages: [{ role: 'user', content: `New customer message: "${messageBody}"` }]
   });
 
-  try {
-    const text = response.content[0].text.trim();
-    return JSON.parse(text);
-  } catch {
-    return {
-      intent: 'other',
-      suggestedReply: `Hi! Thanks for reaching out to ${businessLine}. How can I help you today?`,
-      priority: 'normal'
-    };
+  // Extract text from response
+  const text = response.content[0].text.trim();
+
+  // Try to parse JSON — handle markdown fences if Claude wraps it
+  let cleaned = text;
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
+  // Find first { and last } in case there's preamble
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed.suggestedReply) return parsed;
+  } catch (e) {
+    console.error('AI JSON parse error:', e.message, 'Raw:', text.substring(0, 200));
+  }
+  // If JSON parsing failed, treat the raw text as the reply itself
+  return {
+    intent: 'other',
+    suggestedReply: text || `Hi ${customerName !== 'unknown' ? customerName + '!' : 'there!'} Thanks for reaching out. How can I help?`,
+    priority: 'normal'
+  };
 }
+
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  sseClients.add(res);
+  const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch { clearInterval(hb); } }, 25000);
+  req.on('close', () => { sseClients.delete(res); clearInterval(hb); });
+});
 
 // ── Pending reply timers ─────────────────────────────────────────────────────
 const pendingTimers = {};
@@ -103,12 +137,7 @@ function schedulePendingSend(pendingId, db) {
     delete freshDB.pendingReplies[pendingId];
     saveDB(freshDB);
 
-    // Notify Kyle it was auto-sent
-    await twilioClient.messages.create({
-      body: `⏱ Auto-sent to ${pending.customerPhone}:\n"${pending.suggestedReply}"`,
-      from: pending.fromNumber,
-      to: KYLE_PHONE
-    });
+    // Auto-sent. Dashboard will reflect via reload.
     delete pendingTimers[pendingId];
   }, AUTO_SEND_SECONDS * 1000);
 }
@@ -187,24 +216,17 @@ app.post('/webhook/inbound', async (req, res) => {
     };
     saveDB(freshDB);
 
-    // Text Kyle
-    const customerName = freshDB.customers[fromPhone]?.name || fromPhone;
-    const notifyMsg =
-      `${businessLine} - New message\n` +
-      `From: ${customerName}\n` +
-      `Intent: ${ai.intent}\n\n` +
-      `"${body}"\n\n` +
-      `💬 Suggested reply:\n"${ai.suggestedReply}"\n\n` +
-      `Reply YES to send • NO to write your own • ignore = auto-sends in ${AUTO_SEND_SECONDS}s\n` +
-      `[ID:${pendingId}]`;
-
-    await twilioClient.messages.create({
-      body: notifyMsg,
-      from: fromNumberLabel,
-      to: KYLE_PHONE
+    // Broadcast to dashboard so it updates instantly
+    broadcastSSE({
+      type: 'new_message',
+      customerPhone: fromPhone,
+      customerName: freshDB.customers[fromPhone]?.name || fromPhone,
+      businessLine,
+      message: body,
+      suggestedReply: ai.suggestedReply
     });
 
-    // Schedule auto-send
+    // Schedule auto-send (notification handled in dashboard via SSE)
     schedulePendingSend(pendingId, freshDB);
 
   } catch (err) {
@@ -212,87 +234,6 @@ app.post('/webhook/inbound', async (req, res) => {
   }
 });
 
-// ── Inbound SMS from Kyle (his replies) ─────────────────────────────────────
-app.post('/webhook/kyle', async (req, res) => {
-  const twiml = new twilio.twiml.MessagingResponse();
-  res.type('text/xml').send(twiml.toString());
-
-  try {
-    const body   = req.body.Body?.trim();
-    const toNum  = req.body.To; // which number Kyle texted from
-
-    const db      = loadDB();
-    const pendings = Object.values(db.pendingReplies);
-
-    // Find most recent pending for this line
-    const pending = pendings
-      .filter(p => p.fromNumber === toNum)
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-
-    if (!pending) {
-      await twilioClient.messages.create({
-        body: '✅ No pending messages to reply to.',
-        from: toNum,
-        to: KYLE_PHONE
-      });
-      return;
-    }
-
-    const upperBody = body.toUpperCase();
-
-    if (upperBody === 'YES') {
-      // Send suggested reply
-      if (pendingTimers[pending.pendingId]) clearTimeout(pendingTimers[pending.pendingId]);
-      await sendToCustomer(pending.customerPhone, pending.fromNumber, pending.suggestedReply, loadDB());
-      delete db.pendingReplies[pending.pendingId];
-      saveDB(db);
-      await twilioClient.messages.create({
-        body: `✅ Sent to ${pending.customerPhone}`,
-        from: toNum,
-        to: KYLE_PHONE
-      });
-
-    } else if (upperBody === 'NO') {
-      // Ask Kyle what to send instead
-      if (pendingTimers[pending.pendingId]) clearTimeout(pendingTimers[pending.pendingId]);
-      // Mark as waiting for custom reply
-      db.pendingReplies[pending.pendingId].waitingCustom = true;
-      saveDB(db);
-      await twilioClient.messages.create({
-        body: `✏️ What would you like to say to ${pending.customerPhone}? (Reply with your message)`,
-        from: toNum,
-        to: KYLE_PHONE
-      });
-
-    } else if (pending.waitingCustom) {
-      // This is Kyle's custom reply
-      if (pendingTimers[pending.pendingId]) clearTimeout(pendingTimers[pending.pendingId]);
-      await sendToCustomer(pending.customerPhone, pending.fromNumber, body, loadDB());
-      delete db.pendingReplies[pending.pendingId];
-      saveDB(db);
-      await twilioClient.messages.create({
-        body: `✅ Sent to ${pending.customerPhone}`,
-        from: toNum,
-        to: KYLE_PHONE
-      });
-
-    } else {
-      // Could be a direct custom reply (not YES/NO flow) - send it directly
-      if (pendingTimers[pending.pendingId]) clearTimeout(pendingTimers[pending.pendingId]);
-      await sendToCustomer(pending.customerPhone, pending.fromNumber, body, loadDB());
-      delete db.pendingReplies[pending.pendingId];
-      saveDB(db);
-      await twilioClient.messages.create({
-        body: `✅ Sent to ${pending.customerPhone}`,
-        from: toNum,
-        to: KYLE_PHONE
-      });
-    }
-
-  } catch (err) {
-    console.error('Kyle reply error:', err);
-  }
-});
 
 // ── Extra API routes ─────────────────────────────────────────────────────────
 
@@ -341,7 +282,7 @@ app.post('/api/call', async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/webhook/call-bridge', (req, res) => {
+app.all('/webhook/call-bridge', (req, res) => {
   const to = req.query.to;
   const from = req.query.from;
   const twiml = new twilio.twiml.VoiceResponse();
@@ -382,6 +323,30 @@ app.post('/api/new-call', async (req, res) => {
     });
     res.json({ ok: true, phone });
   } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── PWA: manifest + icon ─────────────────────────────────────────────────────
+app.get('/manifest.json', (req, res) => {
+  res.json({
+    name: 'Roof Revival SMS',
+    short_name: 'SMS Hub',
+    description: 'SMS dashboard for Roof Revival & Christmas Lights',
+    start_url: '/',
+    display: 'standalone',
+    background_color: '#0f0f23',
+    theme_color: '#6c63ff',
+    orientation: 'portrait',
+    icons: [
+      { src: '/icon.png', sizes: '192x192', type: 'image/svg+xml', purpose: 'any maskable' },
+      { src: '/icon.png', sizes: '512x512', type: 'image/svg+xml', purpose: 'any maskable' }
+    ]
+  });
+});
+
+app.get('/icon.png', (req, res) => {
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.send(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="100" fill="#6c63ff"/><text x="50%" y="55%" font-size="280" text-anchor="middle" dominant-baseline="middle" font-family="system-ui">📱</text></svg>`);
 });
 
 // ── Web Dashboard ────────────────────────────────────────────────────────────
@@ -444,6 +409,12 @@ app.get('/', (req, res) => {
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SMS Hub">
 <title>SMS Hub</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SMS Hub">
+<meta name="theme-color" content="#0f0f23">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 body{font-family:-apple-system,sans-serif;background:#0f0f23;color:#e8e8ff;min-height:100vh}
@@ -566,8 +537,58 @@ document.querySelectorAll('[id^="timer-"]').forEach(el => {
   }, 1000);
 });
 
-// Reload every 30s to pick up new messages
-setInterval(() => location.reload(), 30000);
+// Real-time updates via SSE + browser notifications
+let evtSource = null;
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/api/events');
+  evtSource.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.type === 'new_message') {
+        // Show browser notification if permission granted
+        if ('Notification' in window && Notification.permission === 'granted') {
+          const n = new Notification(d.businessLine || 'New SMS', {
+            body: (d.customerName || 'Unknown') + ': ' + (d.message || '(media)'),
+            icon: '/icon.png',
+            tag: d.customerPhone,
+            requireInteraction: false
+          });
+          n.onclick = () => { window.focus(); n.close(); };
+        }
+        // Play a soft beep
+        try {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const o = ctx.createOscillator(); const g = ctx.createGain();
+          o.connect(g); g.connect(ctx.destination);
+          o.frequency.value = 880; g.gain.value = 0.1;
+          o.start(); o.stop(ctx.currentTime + 0.15);
+        } catch(e) {}
+        // Refresh the page to show the new card
+        setTimeout(() => location.reload(), 500);
+      }
+    } catch(e) {}
+  };
+  evtSource.onerror = () => { setTimeout(connectSSE, 3000); };
+}
+connectSSE();
+
+// Ask for notification permission on first interaction
+function askNotifPerm() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    Notification.requestPermission().then(p => {
+      if (p === 'granted') showToast('🔔 Notifications enabled!');
+    });
+  }
+}
+// Trigger on first user interaction
+['click','touchstart','keydown'].forEach(ev => {
+  document.addEventListener(ev, askNotifPerm, {once: true});
+});
+
+// Fallback reload every 60s (in case SSE disconnects silently)
+setInterval(() => location.reload(), 60000);
 
 // Pending card actions
 async function sendSugg(pendingId, phone) {
