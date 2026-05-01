@@ -328,32 +328,44 @@ app.post('/api/call', async (req, res) => {
 });
 
 app.all('/webhook/call-bridge', (req, res) => {
-  // Phone numbers come from query string; + can become a space, decode/clean it
-  let to = (req.query.to || req.body?.to || '').toString().trim().replace(/\s/g, '+');
-  let from = (req.query.from || req.body?.from || '').toString().trim().replace(/\s/g, '+');
+  // Phone numbers come from query string. URL-decode any encoded chars,
+  // and handle '+' being decoded to space.
+  let toRaw = req.query.to || req.body?.to || '';
+  let fromRaw = req.query.from || req.body?.from || '';
 
-  // Strip any non-phone chars except leading +, ensure E.164
+  // Replace spaces back to +
+  let to = toRaw.toString().replace(/ /g, '+');
+  let from = fromRaw.toString().replace(/ /g, '+');
+
+  // Sanitize: keep only digits and a single leading +
   to = to.replace(/[^+\d]/g, '');
   from = from.replace(/[^+\d]/g, '');
   if (!to.startsWith('+')) to = '+' + to;
   if (!from.startsWith('+')) from = '+' + from;
 
+  console.log('[call-bridge] dialing', JSON.stringify({to, from, raw: {toRaw, fromRaw}}));
+
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say({ voice: 'Polly.Joanna' }, 'Connecting you to your customer now.');
-  // hangupOnStar=false, action handler ensures call ends cleanly
+  twiml.say({ voice: 'Polly.Joanna' }, 'Connecting you now.');
   const dial = twiml.dial({
     callerId: from,
     timeout: 30,
-    answerOnBridge: true,
     action: '/webhook/call-bridge-done',
     method: 'POST'
   });
   dial.number(to);
-  res.type('text/xml').send(twiml.toString());
+  const xml = twiml.toString();
+  console.log('[call-bridge] TwiML:', xml);
+  res.type('text/xml').send(xml);
 });
 
-// When the bridged call ends, hang up both legs cleanly
+// When the bridged call ends — hang up cleanly, no fallback
 app.all('/webhook/call-bridge-done', (req, res) => {
+  console.log('[call-bridge-done]', JSON.stringify({
+    DialCallStatus: req.body?.DialCallStatus,
+    DialCallDuration: req.body?.DialCallDuration,
+    CallStatus: req.body?.CallStatus
+  }));
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.hangup();
   res.type('text/xml').send(twiml.toString());
