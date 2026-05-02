@@ -373,6 +373,49 @@ app.all('/webhook/call-bridge-done', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
+// ── INBOUND VOICE: Ring Kyle 7s, if no answer go to VAPI ─────────────────────
+const VAPI_NUMBER = '+13526489684';
+
+app.all('/webhook/voice-inbound', (req, res) => {
+  // Customer called Roof or Lights number → ring Kyle for 7s with action callback
+  const toNumber = req.body?.To || req.query?.To || '';
+  const callerNumber = req.body?.From || req.query?.From || '';
+
+  console.log('[voice-inbound]', JSON.stringify({ toNumber, callerNumber }));
+
+  const twiml = new twilio.twiml.VoiceResponse();
+  const dial = twiml.dial({
+    timeout: 7,
+    callerId: toNumber, // show Twilio biz number on Kyle's screen
+    action: '/webhook/voice-after-kyle?caller=' + encodeURIComponent(callerNumber),
+    method: 'POST'
+  });
+  dial.number(KYLE_PHONE);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// After Kyle dial: if he answered, hang up everyone. If no answer, go to VAPI.
+app.all('/webhook/voice-after-kyle', (req, res) => {
+  const dialStatus = req.body?.DialCallStatus || '';
+  const caller = req.query?.caller || req.body?.caller || '';
+
+  console.log('[voice-after-kyle]', JSON.stringify({ dialStatus, caller }));
+
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  // If Kyle answered the call, just hang up (the dial already ended naturally)
+  if (dialStatus === 'completed' || dialStatus === 'answered') {
+    twiml.hangup();
+  } else {
+    // Kyle didn't answer (no-answer, busy, failed) — forward to VAPI
+    // Pass the original caller number through callerId so VAPI sees who's calling
+    const dial = twiml.dial({ callerId: caller });
+    dial.number(VAPI_NUMBER);
+  }
+
+  res.type('text/xml').send(twiml.toString());
+});
+
 // API: send new SMS to any number
 app.post('/api/new-sms', async (req, res) => {
   try {
