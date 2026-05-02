@@ -536,7 +536,19 @@ app.post('/webhook/inbound', async (req, res) => {
       timestamp: new Date().toISOString()
     });
     db.customers[fromPhone].lastContact = new Date().toISOString();
+    // If customer was archived, automatically un-archive when they reach out again
+    // (unless they're blocked, in which case we leave them archived/blocked)
+    if (db.customers[fromPhone].archived && !db.customers[fromPhone].blocked) {
+      delete db.customers[fromPhone].archived;
+      delete db.customers[fromPhone].archivedAt;
+    }
     saveDB(db);
+
+    // If customer is blocked, do NOT generate AI reply or notify
+    if (db.customers[fromPhone].blocked) {
+      console.log(`Inbound from blocked number ${fromPhone} — skipping AI reply`);
+      return;
+    }
 
     // Get AI suggestion — wrapped so a failure never crashes the webhook
     let ai = { intent: 'other', suggestedReply: `Hi! Thanks for reaching out. How can I help you today?`, priority: 'normal' };
@@ -581,8 +593,11 @@ app.post('/webhook/inbound', async (req, res) => {
 // API: get all data (for dashboard polling)
 app.get('/api/data', (req, res) => {
   const db = loadDB();
-  const customers = Object.values(db.customers).sort((a,b)=>new Date(b.lastContact)-new Date(a.lastContact));
-  res.json({ customers, pendingReplies: db.pendingReplies });
+  const showArchived = req.query.archived === '1';
+  const all = Object.values(db.customers).sort((a,b)=>new Date(b.lastContact)-new Date(a.lastContact));
+  const customers = showArchived ? all.filter(c => c.archived) : all.filter(c => !c.archived);
+  const archivedCount = all.filter(c => c.archived).length;
+  res.json({ customers, pendingReplies: db.pendingReplies, archivedCount });
 });
 
 // API: send reply from dashboard
@@ -608,6 +623,125 @@ app.post('/api/dismiss', (req, res) => {
   const db = loadDB();
   delete db.pendingReplies[pendingId];
   saveDB(db);
+  res.json({ ok: true });
+});
+
+// ─── Archive a conversation (soft delete — moves to archive view) ──────────
+app.post('/api/customer/:phone/archive', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone]) {
+    db.customers[phone].archived = true;
+    db.customers[phone].archivedAt = new Date().toISOString();
+    saveDB(db);
+  }
+  // Also clear any pending replies for this customer
+  Object.keys(db.pendingReplies).forEach(pid => {
+    if (db.pendingReplies[pid].customerPhone === phone) {
+      if (pendingTimers[pid]) { clearTimeout(pendingTimers[pid]); delete pendingTimers[pid]; }
+      delete db.pendingReplies[pid];
+    }
+  });
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+// ─── Unarchive a conversation ──────────────────────────────────────────────
+app.post('/api/customer/:phone/unarchive', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone]) {
+    delete db.customers[phone].archived;
+    delete db.customers[phone].archivedAt;
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
+// ─── Hard delete a conversation (permanent) ────────────────────────────────
+app.post('/api/customer/:phone/delete', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  delete db.customers[phone];
+  Object.keys(db.pendingReplies).forEach(pid => {
+    if (db.pendingReplies[pid].customerPhone === phone) {
+      if (pendingTimers[pid]) { clearTimeout(pendingTimers[pid]); delete pendingTimers[pid]; }
+      delete db.pendingReplies[pid];
+    }
+  });
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+// ─── Block / unblock (block = stop AI auto-reply, hide from inbox, mark spam) ─
+app.post('/api/customer/:phone/block', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone]) {
+    db.customers[phone].blocked = true;
+    db.customers[phone].blockedAt = new Date().toISOString();
+    db.customers[phone].archived = true; // also archive
+    saveDB(db);
+  }
+  // Cancel any pending AI replies
+  Object.keys(db.pendingReplies).forEach(pid => {
+    if (db.pendingReplies[pid].customerPhone === phone) {
+      if (pendingTimers[pid]) { clearTimeout(pendingTimers[pid]); delete pendingTimers[pid]; }
+      delete db.pendingReplies[pid];
+    }
+  });
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.post('/api/customer/:phone/unblock', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone]) {
+    delete db.customers[phone].blocked;
+    delete db.customers[phone].blockedAt;
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
+// ─── Mark conversation as unread ───────────────────────────────────────────
+app.post('/api/customer/:phone/mark-unread', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone] && db.customers[phone].messages.length > 0) {
+    // Mark the most recent inbound message as unread
+    for (let i = db.customers[phone].messages.length - 1; i >= 0; i--) {
+      if (db.customers[phone].messages[i].direction === 'in') {
+        db.customers[phone].messages[i].read = false;
+        break;
+      }
+    }
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
+// ─── Save customer notes ──────────────────────────────────────────────────
+app.post('/api/customer/:phone/notes', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const db = loadDB();
+  if (db.customers[phone]) {
+    db.customers[phone].notes = req.body.notes || '';
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
+// ─── Delete a single message ──────────────────────────────────────────────
+app.post('/api/customer/:phone/message/:idx/delete', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const idx = parseInt(req.params.idx, 10);
+  const db = loadDB();
+  if (db.customers[phone] && db.customers[phone].messages[idx]) {
+    db.customers[phone].messages.splice(idx, 1);
+    saveDB(db);
+  }
   res.json({ ok: true });
 });
 
@@ -825,8 +959,11 @@ app.get('/icon.png', (req, res) => {
 // ── Web Dashboard ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   const db = loadDB();
-  const customers = Object.values(db.customers).sort((a,b)=>new Date(b.lastContact)-new Date(a.lastContact));
-  const pendings = Object.values(db.pendingReplies).sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt));
+  const showArchived = req.query.archived === '1';
+  const allCustomers = Object.values(db.customers).sort((a,b)=>new Date(b.lastContact)-new Date(a.lastContact));
+  const customers = showArchived ? allCustomers.filter(c => c.archived) : allCustomers.filter(c => !c.archived);
+  const archivedCount = allCustomers.filter(c => c.archived).length;
+  const pendings = showArchived ? [] : Object.values(db.pendingReplies).sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt));
 
   const pendingCards = pendings.map(p => {
     const name = db.customers[p.customerPhone]?.name || p.customerPhone;
@@ -855,26 +992,36 @@ app.get('/', (req, res) => {
     </div>`;
   }).join('');
 
+  // Phone formatter: +13527381825 -> (352) 738-1825
+  const fmtPhone = (p) => {
+    const d = (p || '').replace(/\D/g,'');
+    if (d.length === 11 && d[0] === '1') return `(${d.slice(1,4)}) ${d.slice(4,7)}-${d.slice(7)}`;
+    if (d.length === 10) return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+    return p;
+  };
+
   const customerRows = customers.map(c => {
     const last = c.messages[c.messages.length-1];
     const unread = c.messages.filter(m=>m.direction==='in'&&!m.read).length;
     const isRoof = c.line && c.line.includes('ROOF');
-    const preview = last ? (last.body||'').substring(0,50) : '';
+    const lastBody = last ? (last.body || (last.mediaUrl ? '📎 Media' : '')) : '';
+    const preview = lastBody.length > 60 ? lastBody.substring(0,60) + '…' : lastBody;
+    const displayName = c.name || fmtPhone(c.phone);
     // Build a search blob with name + phone + line + preview for fast client-side filter
-    const searchBlob = ((c.name||'') + ' ' + (c.phone||'') + ' ' + (c.line||'') + ' ' + preview).toLowerCase();
+    const searchBlob = ((c.name||'') + ' ' + (c.phone||'') + ' ' + fmtPhone(c.phone) + ' ' + (c.line||'') + ' ' + lastBody).toLowerCase();
     return `
     <div class="crow" data-search="${searchBlob.replace(/"/g,'')}" onclick="location='/customer/${encodeURIComponent(c.phone)}'">
       <div class="cav ${isRoof?'avr':'avl'}">${isRoof?'🏠':'💡'}</div>
       <div class="cinfo">
-        <div class="cname">${c.name || c.phone}</div>
-        <div class="cprev">${preview}</div>
+        <div class="cname">${displayName}${c.blocked ? ' <span style="background:#ef476f;color:#fff;font-size:9px;padding:1px 5px;border-radius:4px;font-weight:600;letter-spacing:.5px">BLOCKED</span>' : ''}</div>
+        <div class="cprev">${preview.replace(/</g,'&lt;')}</div>
       </div>
       <div class="cmeta">
         <div class="ctime">${last ? new Date(last.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : ''}</div>
         ${unread>0?`<div class="ubadge">${unread}</div>`:''}
       </div>
     </div>`;
-  }).join('') || '<div class="empty" id="emptyState">No messages yet</div>';
+  }).join('') || `<div class="empty" id="emptyState">${showArchived ? 'No archived conversations' : 'No messages yet'}</div>`;
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -965,7 +1112,10 @@ body{font-family:-apple-system,sans-serif;background:#0f0f23;color:#e8e8ff;min-h
 
 ${pendings.length > 0 ? `<div class="section-title">⏳ Needs Reply</div>${pendingCards}` : ''}
 
-<div class="section-title">💬 Conversations</div>
+<div class="section-title" style="display:flex;align-items:center;justify-content:space-between;padding-right:16px">
+  <span>${showArchived ? '📦 Archived' : '💬 Conversations'}</span>
+  <a href="${showArchived ? '/' : '/?archived=1'}" style="font-size:12px;color:#6c63ff;text-decoration:none">${showArchived ? '← Back to inbox' : (archivedCount > 0 ? `View archived (${archivedCount})` : '')}</a>
+</div>
 <div style="margin:0 16px 10px;display:flex;gap:8px;align-items:center">
   <input id="searchBox" type="search" placeholder="Search by name, phone, or message…" style="flex:1;padding:10px 14px;border:1px solid #2e2e55;background:#1a1a35;color:#e8e8ff;border-radius:10px;font-size:14px;outline:none" oninput="filterCustomers(this.value)">
   <button id="notifBtn" onclick="enableNotifs()" style="background:#6c63ff;color:#fff;border:none;border-radius:10px;padding:10px 14px;font-size:13px;cursor:pointer;white-space:nowrap;display:none">🔔 Enable Alerts</button>
@@ -1247,28 +1397,39 @@ app.get('/customer/:phone', (req, res) => {
   const customer = db.customers[phone];
   if (!customer) return res.status(404).send('Not found');
 
-  const messages = customer.messages.map(m => {
+  // Format phone number for display: (352) 738-1825
+  const formatPhone = (p) => {
+    const d = (p || '').replace(/\D/g,'');
+    if (d.length === 11 && d[0] === '1') return `(${d.slice(1,4)}) ${d.slice(4,7)}-${d.slice(7)}`;
+    if (d.length === 10) return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+    return p;
+  };
+  const displayPhone = formatPhone(phone);
+
+  const messages = customer.messages.map((m, idx) => {
     let mediaHtml = '';
     if (m.mediaUrl) {
       const urls = Array.isArray(m.mediaUrl) ? m.mediaUrl : [m.mediaUrl];
       mediaHtml = urls.map(url => {
         const lower = (url || '').toLowerCase();
-        // Try image first (covers most uploads + Twilio's default for images even without extension)
         const looksImage = lower.match(/\.(jpg|jpeg|png|gif|webp)($|\?)/) || lower.includes('mediacontenttype=image') || lower.includes('twilio.com/');
         const looksVideo = lower.match(/\.(mp4|mov|webm)($|\?)/);
         if (looksVideo) {
           return `<video src="${url}" controls style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px"></video>`;
         } else if (looksImage) {
-          return `<a href="${url}" target="_blank"><img src="${url}" style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px" onerror="this.replaceWith(Object.assign(document.createElement('a'),{href:'${url}',target:'_blank',textContent:'📎 Attachment'}))"></a>`;
+          return `<img src="${url}" onclick="openLightbox('${url}')" style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px;cursor:zoom-in" onerror="this.replaceWith(Object.assign(document.createElement('a'),{href:'${url}',target:'_blank',textContent:'📎 Attachment'}))">`;
         } else {
           return `<a href="${url}" target="_blank" style="display:block;margin-bottom:6px">📎 Attachment</a>`;
         }
       }).join('');
     }
-    const bodyHtml = m.body ? `<div>${m.body}</div>` : '';
+    const bodyHtml = m.body ? `<div>${m.body.replace(/</g,'&lt;')}</div>` : '';
     return `
-    <div class="msg ${m.direction}">
-      <div class="bubble">${mediaHtml}${bodyHtml}</div>
+    <div class="msg ${m.direction}" data-idx="${idx}">
+      <div class="bubble-wrap">
+        <button class="msg-del" onclick="deleteMsg(${idx})" title="Delete message">×</button>
+        <div class="bubble">${mediaHtml}${bodyHtml}</div>
+      </div>
       <div class="time">${new Date(m.timestamp).toLocaleString()}</div>
     </div>`;
   }).join('');
@@ -1276,130 +1437,340 @@ app.get('/customer/:phone', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
 <head>
-  <title>${customer.name || phone}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${customer.name || displayPhone}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, sans-serif; background: #f5f5f5; }
-    header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
-    header a { color: white; text-decoration: none; font-size: 20px; }
-    .info { background: white; padding: 16px 24px; border-bottom: 1px solid #eee; display: flex; gap: 24px; font-size: 14px; }
-    .info span { color: #666; } .info strong { color: #333; }
-    .name-form { padding: 16px 24px 0; }
-    .name-form input { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; font-size: 14px; }
-    .name-form button { background: #1a1a2e; color: white; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; margin-left: 8px; }
-    .messages { padding: 24px; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow-y: auto; }
-    .msg { display: flex; flex-direction: column; max-width: 70%; }
+    body { font-family: -apple-system, sans-serif; background: #0f0f23; color: #e8e8ff; min-height: 100vh; }
+    header { background: #1a1a35; color: white; padding: 14px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #2e2e55; position: sticky; top: 0; z-index: 5; }
+    header a.back { color: #8888aa; text-decoration: none; font-size: 24px; flex-shrink: 0; }
+    .htitle { flex: 1; min-width: 0; }
+    .hname { font-size: 17px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .hsub { font-size: 12px; color: #8888aa; }
+    .hbtn { background: transparent; border: 1px solid #2e2e55; color: #e8e8ff; border-radius: 8px; padding: 7px 10px; font-size: 16px; cursor: pointer; flex-shrink: 0; }
+    .hbtn.call { background: #00d4aa; color: #000; border-color: #00d4aa; }
+    .info { background: #1a1a35; padding: 12px 16px; border-bottom: 1px solid #2e2e55; display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; }
+    .info span { color: #8888aa; } .info strong { color: #e8e8ff; }
+    .actions-row { background: #1a1a35; padding: 10px 16px; border-bottom: 1px solid #2e2e55; display: flex; flex-wrap: wrap; gap: 6px; }
+    .act { background: #252545; border: 1px solid #2e2e55; color: #e8e8ff; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+    .act:hover { background: #2e2e55; }
+    .act.danger { color: #ef476f; border-color: #ef476f33; }
+    .act.danger:hover { background: rgba(239,71,111,0.15); }
+    .act.warn { color: #ffd166; border-color: #ffd16633; }
+    .name-form { padding: 12px 16px; background: #1a1a35; border-bottom: 1px solid #2e2e55; display: flex; gap: 8px; align-items: center; }
+    .name-form input { flex: 1; border: 1px solid #2e2e55; background: #252545; color: #e8e8ff; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; }
+    .name-form input:focus { border-color: #6c63ff; }
+    .name-form button { background: #6c63ff; color: white; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+    .notes-row { padding: 12px 16px; background: #1a1a35; border-bottom: 1px solid #2e2e55; }
+    .notes-row label { display: block; font-size: 11px; color: #8888aa; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+    .notes-row textarea { width: 100%; background: #252545; border: 1px solid #2e2e55; color: #e8e8ff; border-radius: 8px; padding: 8px 12px; font-size: 13px; resize: vertical; min-height: 50px; font-family: inherit; outline: none; }
+    .notes-row textarea:focus { border-color: #6c63ff; }
+    .notes-row button { margin-top: 6px; background: #252545; border: 1px solid #2e2e55; color: #e8e8ff; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+    .notes-row .saved { color: #00d4aa; font-size: 12px; margin-left: 8px; opacity: 0; transition: opacity .3s; }
+    .notes-row .saved.on { opacity: 1; }
+    .messages { padding: 16px; display: flex; flex-direction: column; gap: 10px; min-height: 40vh; max-height: calc(100vh - 380px); overflow-y: auto; }
+    .msg { display: flex; flex-direction: column; max-width: 80%; }
     .msg.in { align-self: flex-start; }
     .msg.out { align-self: flex-end; align-items: flex-end; }
-    .bubble { padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.4; }
-    .msg.in .bubble { background: white; border: 1px solid #eee; }
-    .msg.out .bubble { background: #1a1a2e; color: white; }
-    .time { font-size: 11px; color: #999; margin-top: 4px; padding: 0 4px; }
-    .reply-box { padding: 16px 24px; background: white; border-top: 1px solid #eee; display: flex; gap: 12px; }
-    .reply-box textarea { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 10px; font-size: 14px; resize: none; height: 60px; }
-    .reply-box button { background: #1a1a2e; color: white; border: none; border-radius: 8px; padding: 10px 20px; cursor: pointer; font-size: 14px; }
+    .bubble-wrap { position: relative; display: flex; align-items: flex-start; gap: 4px; }
+    .msg.out .bubble-wrap { flex-direction: row-reverse; }
+    .bubble { padding: 10px 14px; border-radius: 18px; font-size: 14px; line-height: 1.4; word-break: break-word; }
+    .msg.in .bubble { background: #1a1a35; border: 1px solid #2e2e55; border-bottom-left-radius: 4px; }
+    .msg.out .bubble { background: #6c63ff; color: white; border-bottom-right-radius: 4px; }
+    .msg-del { background: #252545; border: 1px solid #2e2e55; color: #8888aa; border-radius: 50%; width: 22px; height: 22px; font-size: 14px; line-height: 1; cursor: pointer; padding: 0; opacity: 0; transition: opacity .15s; flex-shrink: 0; align-self: center; }
+    .bubble-wrap:hover .msg-del { opacity: 1; }
+    .msg-del:hover { color: #ef476f; border-color: #ef476f; }
+    .time { font-size: 10px; color: #8888aa; margin-top: 3px; padding: 0 4px; }
+    .reply-box { padding: 12px 16px; background: #1a1a35; border-top: 1px solid #2e2e55; display: flex; gap: 8px; align-items: flex-end; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+    .reply-box textarea { flex: 1; border: 1px solid #2e2e55; background: #252545; color: #e8e8ff; border-radius: 18px; padding: 10px 14px; font-size: 14px; resize: none; min-height: 42px; max-height: 120px; font-family: inherit; outline: none; }
+    .reply-box textarea:focus { border-color: #6c63ff; }
+    .reply-box button { background: #6c63ff; color: white; border: none; border-radius: 50%; width: 42px; height: 42px; cursor: pointer; font-size: 18px; flex-shrink: 0; }
+    .reply-box button.attach { background: #252545; border: 1px solid #2e2e55; color: #e8e8ff; }
+    /* Lightbox */
+    .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.95); z-index: 1000; display: none; align-items: center; justify-content: center; padding: 20px; }
+    .lightbox.on { display: flex; }
+    .lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+    .lightbox-close { position: absolute; top: 16px; right: 16px; background: rgba(255,255,255,.15); color: white; border: none; border-radius: 50%; width: 44px; height: 44px; font-size: 22px; cursor: pointer; backdrop-filter: blur(10px); }
+    .lightbox-close:hover { background: rgba(255,255,255,.25); }
+    /* Toast */
+    .toast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); background: #252545; border: 1px solid #2e2e55; border-radius: 10px; padding: 10px 20px; font-size: 14px; color: #e8e8ff; z-index: 999; opacity: 0; transition: opacity .3s; pointer-events: none; }
+    .toast.on { opacity: 1; }
+    /* Banners */
+    .banner { padding: 8px 16px; font-size: 13px; text-align: center; }
+    .banner.archived { background: #ffd16622; color: #ffd166; border-bottom: 1px solid #ffd16644; }
+    .banner.blocked { background: #ef476f22; color: #ef476f; border-bottom: 1px solid #ef476f44; }
+    /* Media preview */
+    #mediaPreview { padding: 8px 16px; background: #252545; border-top: 1px solid #2e2e55; display: none; align-items: center; gap: 12px; }
+    #mediaPreview img, #mediaPreview video { max-width: 80px; max-height: 80px; border-radius: 6px; }
+    #mediaPreview span { font-size: 12px; color: #8888aa; flex: 1; }
+    #mediaPreview .rm { background: #ef476f; color: white; border: none; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
   </style>
 </head>
 <body>
   <header>
-    <a href="/">←</a>
-    <div style="flex:1">
-      <div style="font-size:18px;font-weight:600">${customer.name || phone}</div>
-      <div style="font-size:13px;opacity:0.8">${customer.line}</div>
+    <a href="/" class="back">‹</a>
+    <div class="htitle">
+      <div class="hname" id="custName">${(customer.name || displayPhone).replace(/'/g, "&apos;")}</div>
+      <div class="hsub">${customer.line || ''}</div>
     </div>
-    <button onclick="callCustomer()" style="background:#00d4aa;color:#000;border:none;border-radius:8px;padding:8px 12px;font-size:16px;cursor:pointer;margin-left:8px" title="Call customer">📞</button>
+    <button class="hbtn call" onclick="callCustomer()" title="Call customer">📞</button>
   </header>
+
+  ${customer.blocked ? '<div class="banner blocked">🚫 This number is BLOCKED — AI will not auto-reply</div>' : ''}
+  ${customer.archived && !customer.blocked ? '<div class="banner archived">📦 Archived conversation</div>' : ''}
+
+  <div class="actions-row">
+    <button class="act" onclick="markUnread()">📬 Mark Unread</button>
+    ${customer.archived
+      ? '<button class="act" onclick="unarchiveConv()">📥 Unarchive</button>'
+      : '<button class="act" onclick="archiveConv()">📦 Archive</button>'}
+    ${customer.blocked
+      ? '<button class="act" onclick="unblockNum()">✓ Unblock</button>'
+      : '<button class="act warn" onclick="blockNum()">🚫 Block / Spam</button>'}
+    <button class="act danger" onclick="deleteConv()">🗑 Delete Forever</button>
+  </div>
+
   <div class="info">
-    <div><span>Phone: </span><strong>${phone}</strong></div>
+    <div><span>Phone: </span><strong>${displayPhone}</strong></div>
     <div><span>First contact: </span><strong>${new Date(customer.firstContact).toLocaleDateString()}</strong></div>
     <div><span>Messages: </span><strong>${customer.messages.length}</strong></div>
   </div>
+
   <div class="name-form">
-    <form method="POST" action="/customer/${encodeURIComponent(phone)}/name" style="display:flex;align-items:center;gap:8px">
-      <input name="name" value="${customer.name || ''}" placeholder="Set customer name…">
-      <button type="submit">Save Name</button>
-    </form>
+    <input id="nameInput" value="${(customer.name || '').replace(/"/g, '&quot;')}" placeholder="Set customer name…">
+    <button onclick="saveName()">Save</button>
   </div>
-  <div class="messages">${messages}</div>
-  <div id="mediaPreview" style="padding:8px 24px;background:#f0f4ff;border-top:1px solid #eee;display:none;align-items:center;gap:12px">
-    <img id="mediaPreviewImg" style="max-width:80px;max-height:80px;border-radius:6px;display:none">
-    <video id="mediaPreviewVid" style="max-width:120px;max-height:80px;border-radius:6px;display:none" controls></video>
-    <span id="mediaPreviewName" style="font-size:13px;color:#666"></span>
-    <button onclick="removeMedia()" style="margin-left:auto;background:#e53e3e;color:white;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">✕ Remove</button>
+
+  <div class="notes-row">
+    <label>📝 Notes (private)</label>
+    <textarea id="notesInput" placeholder="Address, preferences, what they want, follow-ups…">${(customer.notes || '').replace(/</g, '&lt;')}</textarea>
+    <button onclick="saveNotes()">Save Notes</button>
+    <span class="saved" id="notesSaved">✓ Saved</span>
   </div>
+
+  <div class="messages" id="messagesEl">${messages}</div>
+
+  <div id="mediaPreview">
+    <img id="mediaPreviewImg" style="display:none">
+    <video id="mediaPreviewVid" style="display:none" controls></video>
+    <span id="mediaPreviewName"></span>
+    <button class="rm" onclick="removeMedia()">✕</button>
+  </div>
+
   <div class="reply-box">
     <input type="file" id="mediaInput" accept="image/*,video/mp4,video/quicktime,image/gif" style="display:none" onchange="handleMediaSelect(this)">
-    <button onclick="document.getElementById('mediaInput').click()" style="background:#f0f4ff;color:#1a1a2e;border:1px solid #ddd;border-radius:8px;padding:10px 14px;cursor:pointer;font-size:18px" title="Attach photo/video/GIF">📎</button>
-    <textarea id="replyText" placeholder="Type a reply…"></textarea>
-    <button id="sendBtn" onclick="sendReply()">Send</button>
+    <button class="attach" onclick="document.getElementById('mediaInput').click()" title="Attach photo/video/GIF">📎</button>
+    <textarea id="replyText" placeholder="Type a reply…" rows="1" oninput="autoResize(this)" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendReply()}"></textarea>
+    <button id="sendBtn" onclick="sendReply()">➤</button>
   </div>
-  <script>
-    document.querySelector('.messages').scrollTop = 999999;
-    let pendingMediaUrl = null;
 
+  <!-- Lightbox -->
+  <div class="lightbox" id="lightbox" onclick="closeLightbox(event)">
+    <button class="lightbox-close" onclick="closeLightbox(event)">✕</button>
+    <img id="lightboxImg" src="" alt="">
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const PHONE = '${phone}';
+    const ENC_PHONE = '${encodeURIComponent(phone)}';
+    let pendingMediaUrl = null;
+    let pendingMediaType = null;
+
+    // Auto-scroll on load
+    const messagesEl = document.getElementById('messagesEl');
+    messagesEl.scrollTop = 999999;
+
+    // ─── Reply / Send ───
+    function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
+
+    async function sendReply() {
+      const ta = document.getElementById('replyText');
+      const text = ta.value.trim();
+      if (!text && !pendingMediaUrl) return;
+      const btn = document.getElementById('sendBtn');
+      btn.textContent = '…'; btn.disabled = true;
+
+      // Smooth append: build the bubble immediately
+      const idx = messagesEl.querySelectorAll('.msg').length;
+      const ts = new Date();
+      let mediaHtml = '';
+      if (pendingMediaUrl) {
+        if ((pendingMediaType||'').startsWith('image')) {
+          mediaHtml = '<img src="'+pendingMediaUrl+'" onclick="openLightbox(\''+pendingMediaUrl+'\')" style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px;cursor:zoom-in">';
+        } else if ((pendingMediaType||'').startsWith('video')) {
+          mediaHtml = '<video src="'+pendingMediaUrl+'" controls style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px"></video>';
+        }
+      }
+      const bodyHtml = text ? '<div>'+text.replace(/</g,'&lt;')+'</div>' : '';
+      const wrap = document.createElement('div');
+      wrap.className = 'msg out';
+      wrap.dataset.idx = idx;
+      wrap.innerHTML = '<div class="bubble-wrap"><button class="msg-del" onclick="deleteMsg('+idx+')" title="Delete">×</button><div class="bubble">'+mediaHtml+bodyHtml+'</div></div><div class="time">'+ts.toLocaleString()+'</div>';
+      messagesEl.appendChild(wrap);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+
+      // Clear input immediately
+      ta.value = ''; ta.style.height = 'auto';
+      const sentMediaUrl = pendingMediaUrl;
+      removeMedia();
+
+      try {
+        const r = await fetch('/customer/'+ENC_PHONE+'/send', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({body: text, mediaUrl: sentMediaUrl})
+        });
+        if (!r.ok) {
+          wrap.style.opacity = '0.5';
+          showToast('❌ Send failed');
+        }
+      } catch(e) {
+        wrap.style.opacity = '0.5';
+        showToast('❌ Network error');
+      }
+      btn.textContent = '➤'; btn.disabled = false;
+    }
+
+    // ─── Media upload ───
     async function handleMediaSelect(input) {
       const file = input.files[0];
       if (!file) return;
-      // Show preview
       const preview = document.getElementById('mediaPreview');
       const img = document.getElementById('mediaPreviewImg');
       const vid = document.getElementById('mediaPreviewVid');
       const name = document.getElementById('mediaPreviewName');
       preview.style.display = 'flex';
-      name.textContent = 'Uploading ' + file.name + '…';
-      img.style.display = 'none';
-      vid.style.display = 'none';
-
+      name.textContent = 'Uploading…';
+      img.style.display = 'none'; vid.style.display = 'none';
       const reader = new FileReader();
       reader.onload = (e) => {
         if (file.type.startsWith('image/')) { img.src = e.target.result; img.style.display = 'block'; }
         else if (file.type.startsWith('video/')) { vid.src = e.target.result; vid.style.display = 'block'; }
       };
       reader.readAsDataURL(file);
-
-      // Upload to server
-      const fd = new FormData();
-      fd.append('file', file);
+      pendingMediaType = file.type;
+      const fd = new FormData(); fd.append('file', file);
       try {
         const r = await fetch('/api/upload', { method: 'POST', body: fd });
         const d = await r.json();
-        if (d.ok) {
-          pendingMediaUrl = d.url;
-          name.textContent = '✓ Ready to send: ' + file.name;
-        } else {
-          name.textContent = '❌ Upload failed';
-          pendingMediaUrl = null;
-        }
-      } catch(e) {
-        name.textContent = '❌ Upload error';
-        pendingMediaUrl = null;
-      }
+        if (d.ok) { pendingMediaUrl = d.url; name.textContent = '✓ ' + file.name; }
+        else { name.textContent = '❌ Upload failed'; pendingMediaUrl = null; }
+      } catch(e) { name.textContent = '❌ Error'; pendingMediaUrl = null; }
     }
 
     function removeMedia() {
-      pendingMediaUrl = null;
+      pendingMediaUrl = null; pendingMediaType = null;
       document.getElementById('mediaPreview').style.display = 'none';
       document.getElementById('mediaInput').value = '';
     }
 
-    async function sendReply() {
-      const text = document.getElementById('replyText').value.trim();
-      if (!text && !pendingMediaUrl) return;
-      const btn = document.getElementById('sendBtn'); btn.textContent='Sending…'; btn.disabled=true;
-      await fetch('/customer/${encodeURIComponent(phone)}/send', {
+    // ─── Call customer ───
+    async function callCustomer() {
+      const fromNumber = '${customer.line && customer.line.includes("ROOF") ? process.env.ROOF_NUMBER : process.env.LIGHTS_NUMBER}';
+      const r = await fetch('/api/call', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerPhone:PHONE,fromNumber})});
+      const d = await r.json();
+      if (d.ok) showToast('📞 Answer your phone to connect');
+      else showToast('❌ Call failed: ' + d.error);
+    }
+
+    // ─── Save name ───
+    async function saveName() {
+      const name = document.getElementById('nameInput').value.trim();
+      await fetch('/customer/'+ENC_PHONE+'/name', {
+        method: 'POST',
+        headers: {'Content-Type':'application/x-www-form-urlencoded'},
+        body: 'name=' + encodeURIComponent(name)
+      });
+      document.getElementById('custName').textContent = name || '${displayPhone}';
+      showToast('✓ Name saved');
+    }
+
+    // ─── Save notes ───
+    let notesTimer = null;
+    document.getElementById('notesInput').addEventListener('input', () => {
+      clearTimeout(notesTimer);
+      notesTimer = setTimeout(saveNotes, 1500); // auto-save after 1.5s of no typing
+    });
+    async function saveNotes() {
+      const notes = document.getElementById('notesInput').value;
+      await fetch('/api/customer/'+ENC_PHONE+'/notes', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({body: text, mediaUrl: pendingMediaUrl})
+        body: JSON.stringify({notes})
       });
-      location.reload();
+      const saved = document.getElementById('notesSaved');
+      saved.classList.add('on');
+      setTimeout(() => saved.classList.remove('on'), 1500);
     }
-    async function callCustomer() {
-      const fromNumber = '${customer.line.includes("ROOF") ? process.env.ROOF_NUMBER : process.env.LIGHTS_NUMBER}';
-      const r = await fetch('/api/call', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customerPhone:'${phone}',fromNumber})});
-      const d = await r.json();
-      if (d.ok) alert('📞 Answer your phone — connecting you to ${phone}');
-      else alert('Call failed: ' + d.error);
+
+    // ─── Action buttons ───
+    async function markUnread() {
+      await fetch('/api/customer/'+ENC_PHONE+'/mark-unread', {method:'POST'});
+      showToast('✓ Marked unread');
+    }
+
+    async function archiveConv() {
+      if (!confirm('Archive this conversation? It will be hidden from the inbox but can be restored.')) return;
+      await fetch('/api/customer/'+ENC_PHONE+'/archive', {method:'POST'});
+      window.location = '/';
+    }
+
+    async function unarchiveConv() {
+      await fetch('/api/customer/'+ENC_PHONE+'/unarchive', {method:'POST'});
+      window.location.reload();
+    }
+
+    async function blockNum() {
+      if (!confirm('Block this number?\n\n• AI will not auto-reply\n• Conversation will be archived\n• Future messages from them will be silently received')) return;
+      await fetch('/api/customer/'+ENC_PHONE+'/block', {method:'POST'});
+      window.location = '/';
+    }
+
+    async function unblockNum() {
+      await fetch('/api/customer/'+ENC_PHONE+'/unblock', {method:'POST'});
+      window.location.reload();
+    }
+
+    async function deleteConv() {
+      if (!confirm('PERMANENTLY DELETE this entire conversation?\n\nThis cannot be undone. Use Archive if you might want it back.')) return;
+      if (!confirm('Are you absolutely sure? This is permanent.')) return;
+      await fetch('/api/customer/'+ENC_PHONE+'/delete', {method:'POST'});
+      window.location = '/';
+    }
+
+    // ─── Delete a single message ───
+    async function deleteMsg(idx) {
+      if (!confirm('Delete this message from the conversation?')) return;
+      await fetch('/api/customer/'+ENC_PHONE+'/message/'+idx+'/delete', {method:'POST'});
+      window.location.reload();
+    }
+
+    // ─── Lightbox ───
+    function openLightbox(url) {
+      const lb = document.getElementById('lightbox');
+      const img = document.getElementById('lightboxImg');
+      img.src = url;
+      lb.classList.add('on');
+      document.body.style.overflow = 'hidden';
+    }
+    function closeLightbox(e) {
+      if (e && e.target.tagName === 'IMG' && e.target.id === 'lightboxImg') return; // don't close when clicking the image itself
+      document.getElementById('lightbox').classList.remove('on');
+      document.body.style.overflow = '';
+    }
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeLightbox();
+    });
+
+    // ─── Toast ───
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('on');
+      setTimeout(() => t.classList.remove('on'), 2500);
     }
   </script>
 </body>
