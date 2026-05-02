@@ -745,6 +745,59 @@ app.post('/api/new-call', async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── PWA: service worker (enables true PWA install on iOS + background notifs) ───
+app.get('/sw.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.send(`
+const CACHE_NAME = 'smshub-v1';
+
+self.addEventListener('install', (e) => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(self.clients.claim());
+});
+
+// Receive push messages and show notifications
+self.addEventListener('push', (e) => {
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; } catch(err) { data = { title: 'New SMS', body: e.data ? e.data.text() : '' }; }
+  const title = data.title || 'New SMS';
+  const opts = {
+    body: data.body || '',
+    icon: '/icon.png',
+    badge: '/icon.png',
+    tag: data.tag || 'sms',
+    data: { url: data.url || '/' },
+    requireInteraction: false
+  };
+  e.waitUntil(self.registration.showNotification(title, opts));
+});
+
+// When user taps the notification, open/focus the dashboard
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const targetUrl = (e.notification.data && e.notification.data.url) || '/';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+      for (const c of list) {
+        if (c.url.includes(self.location.origin) && 'focus' in c) return c.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
+    })
+  );
+});
+
+// Pass-through fetch handler so iOS recognizes this as a real PWA
+self.addEventListener('fetch', (e) => {
+  // Don't intercept API/webhook requests — let them go straight to network
+  // We just need this listener to exist for iOS to treat us as a proper PWA
+});
+  `);
+});
+
 // ── PWA: manifest + icon ─────────────────────────────────────────────────────
 app.get('/manifest.json', (req, res) => {
   res.json({
@@ -807,8 +860,10 @@ app.get('/', (req, res) => {
     const unread = c.messages.filter(m=>m.direction==='in'&&!m.read).length;
     const isRoof = c.line && c.line.includes('ROOF');
     const preview = last ? (last.body||'').substring(0,50) : '';
+    // Build a search blob with name + phone + line + preview for fast client-side filter
+    const searchBlob = ((c.name||'') + ' ' + (c.phone||'') + ' ' + (c.line||'') + ' ' + preview).toLowerCase();
     return `
-    <div class="crow" onclick="location='/customer/${encodeURIComponent(c.phone)}'">
+    <div class="crow" data-search="${searchBlob.replace(/"/g,'')}" onclick="location='/customer/${encodeURIComponent(c.phone)}'">
       <div class="cav ${isRoof?'avr':'avl'}">${isRoof?'🏠':'💡'}</div>
       <div class="cinfo">
         <div class="cname">${c.name || c.phone}</div>
@@ -819,7 +874,7 @@ app.get('/', (req, res) => {
         ${unread>0?`<div class="ubadge">${unread}</div>`:''}
       </div>
     </div>`;
-  }).join('') || '<div class="empty">No messages yet</div>';
+  }).join('') || '<div class="empty" id="emptyState">No messages yet</div>';
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -911,6 +966,11 @@ body{font-family:-apple-system,sans-serif;background:#0f0f23;color:#e8e8ff;min-h
 ${pendings.length > 0 ? `<div class="section-title">⏳ Needs Reply</div>${pendingCards}` : ''}
 
 <div class="section-title">💬 Conversations</div>
+<div style="margin:0 16px 10px;display:flex;gap:8px;align-items:center">
+  <input id="searchBox" type="search" placeholder="Search by name, phone, or message…" style="flex:1;padding:10px 14px;border:1px solid #2e2e55;background:#1a1a35;color:#e8e8ff;border-radius:10px;font-size:14px;outline:none" oninput="filterCustomers(this.value)">
+  <button id="notifBtn" onclick="enableNotifs()" style="background:#6c63ff;color:#fff;border:none;border-radius:10px;padding:10px 14px;font-size:13px;cursor:pointer;white-space:nowrap;display:none">🔔 Enable Alerts</button>
+</div>
+<div id="noResults" style="display:none;text-align:center;padding:20px;color:#8888aa">No matches found</div>
 ${customerRows}
 
 <!-- Compose Modal -->
@@ -939,6 +999,13 @@ ${customerRows}
 </div>
 
 <script>
+// Register service worker (needed for iOS to recognize us as a real PWA)
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.error('SW registration failed:', err));
+  });
+}
+
 const ROOF_NUMBER = '${process.env.ROOF_NUMBER}';
 const LIGHTS_NUMBER = '${process.env.LIGHTS_NUMBER}';
 const AUTO_SEC = ${AUTO_SEND_SECONDS};
@@ -957,26 +1024,101 @@ document.querySelectorAll('[id^="timer-"]').forEach(el => {
   }, 1000);
 });
 
-// Real-time updates via SSE + browser notifications
+// ─── Search ────────────────────────────────────────────────────────────────
+function filterCustomers(query) {
+  const q = (query || '').toLowerCase().trim();
+  const rows = document.querySelectorAll('.crow');
+  let visible = 0;
+  rows.forEach(r => {
+    const blob = r.getAttribute('data-search') || '';
+    if (!q || blob.includes(q)) { r.style.display = ''; visible++; }
+    else { r.style.display = 'none'; }
+  });
+  const noRes = document.getElementById('noResults');
+  if (noRes) noRes.style.display = (q && visible === 0) ? 'block' : 'none';
+}
+
+// ─── Notifications ─────────────────────────────────────────────────────────
+function updateNotifButton() {
+  const btn = document.getElementById('notifBtn');
+  if (!btn) return;
+  if (!('Notification' in window)) { btn.style.display = 'none'; return; }
+  if (Notification.permission === 'granted') {
+    btn.style.display = 'none';
+  } else if (Notification.permission === 'denied') {
+    btn.textContent = '🔕 Alerts Blocked';
+    btn.style.background = '#666';
+    btn.style.display = 'inline-block';
+    btn.disabled = true;
+    btn.title = 'You blocked notifications. Reset in Settings → Notifications.';
+  } else {
+    btn.textContent = '🔔 Enable Alerts';
+    btn.style.background = '#6c63ff';
+    btn.style.display = 'inline-block';
+    btn.disabled = false;
+  }
+}
+
+async function enableNotifs() {
+  if (!('Notification' in window)) { showToast('Your browser does not support notifications'); return; }
+  if (Notification.permission === 'denied') {
+    showToast('Notifications were blocked. Reset in browser/iOS Settings.');
+    return;
+  }
+  const result = await Notification.requestPermission();
+  if (result === 'granted') {
+    showToast('🔔 Notifications enabled!');
+    // Fire a test notification so user sees it works
+    try {
+      const n = new Notification('SMS Hub', { body: 'Notifications are working!', icon: '/icon.png' });
+      setTimeout(()=>n.close(), 4000);
+    } catch(e) {}
+  } else if (result === 'denied') {
+    showToast('Notifications blocked');
+  }
+  updateNotifButton();
+}
+
+// Run on load
+updateNotifButton();
+// Also offer the prompt on first interaction (some browsers require gesture)
+['click','touchstart','keydown'].forEach(ev => {
+  document.addEventListener(ev, () => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      // Don't auto-prompt anymore; just keep the button visible. Re-check.
+      updateNotifButton();
+    }
+  }, {once: true});
+});
+
+// ─── Real-time updates via SSE ─────────────────────────────────────────────
 let evtSource = null;
+let connectAttempts = 0;
+
 function connectSSE() {
-  if (evtSource) evtSource.close();
+  if (evtSource) try { evtSource.close(); } catch(e) {}
   evtSource = new EventSource('/api/events');
+
+  evtSource.onopen = () => { connectAttempts = 0; };
+
   evtSource.onmessage = (e) => {
     try {
       const d = JSON.parse(e.data);
       if (d.type === 'new_message') {
-        // Show browser notification if permission granted
+        // Browser notification
         if ('Notification' in window && Notification.permission === 'granted') {
-          const n = new Notification(d.businessLine || 'New SMS', {
-            body: (d.customerName || 'Unknown') + ': ' + (d.message || '(media)'),
-            icon: '/icon.png',
-            tag: d.customerPhone,
-            requireInteraction: false
-          });
-          n.onclick = () => { window.focus(); n.close(); };
+          try {
+            const n = new Notification(d.businessLine || 'New SMS', {
+              body: (d.customerName || 'Unknown') + ': ' + (d.message || '(media)'),
+              icon: '/icon.png',
+              badge: '/icon.png',
+              tag: d.customerPhone,
+              requireInteraction: false
+            });
+            n.onclick = () => { window.focus(); n.close(); };
+          } catch(err) { console.error('notif error', err); }
         }
-        // Play a soft beep
+        // Soft beep
         try {
           const ctx = new (window.AudioContext || window.webkitAudioContext)();
           const o = ctx.createOscillator(); const g = ctx.createGain();
@@ -984,31 +1126,26 @@ function connectSSE() {
           o.frequency.value = 880; g.gain.value = 0.1;
           o.start(); o.stop(ctx.currentTime + 0.15);
         } catch(e) {}
-        // Refresh the page to show the new card
-        setTimeout(() => location.reload(), 500);
+        // Reload after a longer delay so the notification has time to show on iOS
+        setTimeout(() => location.reload(), 1500);
       }
-    } catch(e) {}
+    } catch(e) { console.error(e); }
   };
-  evtSource.onerror = () => { setTimeout(connectSSE, 3000); };
+
+  evtSource.onerror = () => {
+    connectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, connectAttempts), 30000);
+    setTimeout(connectSSE, delay);
+  };
 }
 connectSSE();
 
-// Ask for notification permission on first interaction
-function askNotifPerm() {
-  if (!('Notification' in window)) return;
-  if (Notification.permission === 'default') {
-    Notification.requestPermission().then(p => {
-      if (p === 'granted') showToast('🔔 Notifications enabled!');
-    });
-  }
-}
-// Trigger on first user interaction
-['click','touchstart','keydown'].forEach(ev => {
-  document.addEventListener(ev, askNotifPerm, {once: true});
-});
-
-// Fallback reload every 60s (in case SSE disconnects silently)
-setInterval(() => location.reload(), 60000);
+// Fallback reload every 90s (in case SSE disconnects silently — increased to give SSE more time)
+setInterval(() => {
+  // Only reload if the search box is empty — don't disrupt search-in-progress
+  const sb = document.getElementById('searchBox');
+  if (!sb || !sb.value) location.reload();
+}, 90000);
 
 // Pending card actions
 async function sendSugg(pendingId, phone) {
