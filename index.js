@@ -4,10 +4,40 @@ const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
+
+// Uploads directory (created if missing) — served publicly so Twilio can fetch media
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOADS_DIR,
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || '.bin';
+      const safeExt = ext.replace(/[^a-z0-9.]/g, '');
+      cb(null, Date.now() + '-' + Math.random().toString(36).slice(2, 8) + safeExt);
+    }
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB cap (Twilio MMS limit ~5MB but allow some headroom)
+});
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Serve uploaded media publicly so Twilio can fetch
+app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
+
+// Upload endpoint — receives a file, returns a public URL
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'no file' });
+  // Build absolute public URL — Twilio needs an https URL it can fetch
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  const url = `${proto}://${host}/uploads/${req.file.filename}`;
+  res.json({ ok: true, url, filename: req.file.filename });
+});
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
@@ -438,15 +468,21 @@ function schedulePendingSend(pendingId, db) {
   }, AUTO_SEND_SECONDS * 1000);
 }
 
-async function sendToCustomer(customerPhone, fromNumber, body, db) {
-  await twilioClient.messages.create({ body, from: fromNumber, to: customerPhone });
+async function sendToCustomer(customerPhone, fromNumber, body, db, mediaUrl) {
+  const params = { from: fromNumber, to: customerPhone };
+  if (body) params.body = body;
+  if (mediaUrl) params.mediaUrl = Array.isArray(mediaUrl) ? mediaUrl : [mediaUrl];
+  // Twilio requires either body or mediaUrl
+  if (!params.body && !params.mediaUrl) params.body = ' ';
+  await twilioClient.messages.create(params);
 
   // Save outbound message
   const customer = db.customers[customerPhone];
   if (customer) {
     customer.messages.push({
       direction: 'out',
-      body,
+      body: body || '',
+      mediaUrl: mediaUrl || null,
       timestamp: new Date().toISOString()
     });
     customer.lastContact = new Date().toISOString();
@@ -462,7 +498,15 @@ app.post('/webhook/inbound', async (req, res) => {
   try {
     const fromPhone  = req.body.From;  // customer's number
     const toNumber   = req.body.To;    // which Twilio number they texted
-    const body       = req.body.Body;
+    const body       = req.body.Body || '';
+
+    // Collect any inbound media URLs from Twilio
+    const numMedia = parseInt(req.body.NumMedia || '0', 10);
+    const incomingMedia = [];
+    for (let i = 0; i < numMedia; i++) {
+      const url = req.body[`MediaUrl${i}`];
+      if (url) incomingMedia.push(url);
+    }
 
     const businessLine = toNumber === ROOF_NUMBER
       ? '🏠 ROOF (352)'
@@ -488,6 +532,7 @@ app.post('/webhook/inbound', async (req, res) => {
     db.customers[fromPhone].messages.push({
       direction: 'in',
       body,
+      mediaUrl: incomingMedia.length > 0 ? incomingMedia : null,
       timestamp: new Date().toISOString()
     });
     db.customers[fromPhone].lastContact = new Date().toISOString();
@@ -543,13 +588,13 @@ app.get('/api/data', (req, res) => {
 // API: send reply from dashboard
 app.post('/api/send', async (req, res) => {
   try {
-    const { customerPhone, body, pendingId } = req.body;
+    const { customerPhone, body, pendingId, mediaUrl } = req.body;
     const db = loadDB();
     const customer = db.customers[customerPhone];
     if (!customer) return res.status(404).json({ error: 'Not found' });
     const fromNumber = customer.line.includes('ROOF') ? ROOF_NUMBER : LIGHTS_NUMBER;
     if (pendingId && pendingTimers[pendingId]) { clearTimeout(pendingTimers[pendingId]); delete pendingTimers[pendingId]; }
-    await sendToCustomer(customerPhone, fromNumber, body, loadDB());
+    await sendToCustomer(customerPhone, fromNumber, body, loadDB(), mediaUrl);
     const db2 = loadDB();
     if (pendingId && db2.pendingReplies[pendingId]) { delete db2.pendingReplies[pendingId]; saveDB(db2); }
     res.json({ ok: true });
@@ -670,7 +715,7 @@ app.all('/webhook/voice-after-kyle', (req, res) => {
 // API: send new SMS to any number
 app.post('/api/new-sms', async (req, res) => {
   try {
-    const { toPhone, body, fromNumber } = req.body;
+    const { toPhone, body, fromNumber, mediaUrl } = req.body;
     let phone = toPhone.replace(/\D/g,'');
     if (phone.length === 10) phone = '+1' + phone;
     else if (!phone.startsWith('+')) phone = '+' + phone;
@@ -680,7 +725,7 @@ app.post('/api/new-sms', async (req, res) => {
     if (!db.customers[phone]) {
       db.customers[phone] = { phone, name: null, line: businessLine, firstContact: new Date().toISOString(), lastContact: new Date().toISOString(), messages: [] };
     }
-    await sendToCustomer(phone, fromNumber, body, db);
+    await sendToCustomer(phone, fromNumber, body, db, mediaUrl);
     res.json({ ok: true, phone });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
@@ -1065,11 +1110,31 @@ app.get('/customer/:phone', (req, res) => {
   const customer = db.customers[phone];
   if (!customer) return res.status(404).send('Not found');
 
-  const messages = customer.messages.map(m => `
+  const messages = customer.messages.map(m => {
+    let mediaHtml = '';
+    if (m.mediaUrl) {
+      const urls = Array.isArray(m.mediaUrl) ? m.mediaUrl : [m.mediaUrl];
+      mediaHtml = urls.map(url => {
+        const lower = (url || '').toLowerCase();
+        // Try image first (covers most uploads + Twilio's default for images even without extension)
+        const looksImage = lower.match(/\.(jpg|jpeg|png|gif|webp)($|\?)/) || lower.includes('mediacontenttype=image') || lower.includes('twilio.com/');
+        const looksVideo = lower.match(/\.(mp4|mov|webm)($|\?)/);
+        if (looksVideo) {
+          return `<video src="${url}" controls style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px"></video>`;
+        } else if (looksImage) {
+          return `<a href="${url}" target="_blank"><img src="${url}" style="max-width:100%;border-radius:8px;display:block;margin-bottom:6px" onerror="this.replaceWith(Object.assign(document.createElement('a'),{href:'${url}',target:'_blank',textContent:'📎 Attachment'}))"></a>`;
+        } else {
+          return `<a href="${url}" target="_blank" style="display:block;margin-bottom:6px">📎 Attachment</a>`;
+        }
+      }).join('');
+    }
+    const bodyHtml = m.body ? `<div>${m.body}</div>` : '';
+    return `
     <div class="msg ${m.direction}">
-      <div class="bubble">${m.body}</div>
+      <div class="bubble">${mediaHtml}${bodyHtml}</div>
       <div class="time">${new Date(m.timestamp).toLocaleString()}</div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   res.send(`<!DOCTYPE html>
 <html>
@@ -1120,21 +1185,75 @@ app.get('/customer/:phone', (req, res) => {
     </form>
   </div>
   <div class="messages">${messages}</div>
+  <div id="mediaPreview" style="padding:8px 24px;background:#f0f4ff;border-top:1px solid #eee;display:none;align-items:center;gap:12px">
+    <img id="mediaPreviewImg" style="max-width:80px;max-height:80px;border-radius:6px;display:none">
+    <video id="mediaPreviewVid" style="max-width:120px;max-height:80px;border-radius:6px;display:none" controls></video>
+    <span id="mediaPreviewName" style="font-size:13px;color:#666"></span>
+    <button onclick="removeMedia()" style="margin-left:auto;background:#e53e3e;color:white;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">✕ Remove</button>
+  </div>
   <div class="reply-box">
+    <input type="file" id="mediaInput" accept="image/*,video/mp4,video/quicktime,image/gif" style="display:none" onchange="handleMediaSelect(this)">
+    <button onclick="document.getElementById('mediaInput').click()" style="background:#f0f4ff;color:#1a1a2e;border:1px solid #ddd;border-radius:8px;padding:10px 14px;cursor:pointer;font-size:18px" title="Attach photo/video/GIF">📎</button>
     <textarea id="replyText" placeholder="Type a reply…"></textarea>
-    <button onclick="sendReply()">Send</button>
+    <button id="sendBtn" onclick="sendReply()">Send</button>
   </div>
   <script>
     document.querySelector('.messages').scrollTop = 999999;
-    document.querySelector('.messages').scrollTop = 999999;
+    let pendingMediaUrl = null;
+
+    async function handleMediaSelect(input) {
+      const file = input.files[0];
+      if (!file) return;
+      // Show preview
+      const preview = document.getElementById('mediaPreview');
+      const img = document.getElementById('mediaPreviewImg');
+      const vid = document.getElementById('mediaPreviewVid');
+      const name = document.getElementById('mediaPreviewName');
+      preview.style.display = 'flex';
+      name.textContent = 'Uploading ' + file.name + '…';
+      img.style.display = 'none';
+      vid.style.display = 'none';
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        if (file.type.startsWith('image/')) { img.src = e.target.result; img.style.display = 'block'; }
+        else if (file.type.startsWith('video/')) { vid.src = e.target.result; vid.style.display = 'block'; }
+      };
+      reader.readAsDataURL(file);
+
+      // Upload to server
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const r = await fetch('/api/upload', { method: 'POST', body: fd });
+        const d = await r.json();
+        if (d.ok) {
+          pendingMediaUrl = d.url;
+          name.textContent = '✓ Ready to send: ' + file.name;
+        } else {
+          name.textContent = '❌ Upload failed';
+          pendingMediaUrl = null;
+        }
+      } catch(e) {
+        name.textContent = '❌ Upload error';
+        pendingMediaUrl = null;
+      }
+    }
+
+    function removeMedia() {
+      pendingMediaUrl = null;
+      document.getElementById('mediaPreview').style.display = 'none';
+      document.getElementById('mediaInput').value = '';
+    }
+
     async function sendReply() {
       const text = document.getElementById('replyText').value.trim();
-      if (!text) return;
-      const btn = event.target; btn.textContent='Sending…'; btn.disabled=true;
+      if (!text && !pendingMediaUrl) return;
+      const btn = document.getElementById('sendBtn'); btn.textContent='Sending…'; btn.disabled=true;
       await fetch('/customer/${encodeURIComponent(phone)}/send', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({body: text})
+        body: JSON.stringify({body: text, mediaUrl: pendingMediaUrl})
       });
       location.reload();
     }
@@ -1167,7 +1286,7 @@ app.post('/customer/:phone/send', async (req, res) => {
   if (!customer) return res.status(404).json({ error: 'Not found' });
 
   const fromNumber = customer.line.includes('ROOF') ? ROOF_NUMBER : LIGHTS_NUMBER;
-  await sendToCustomer(phone, fromNumber, req.body.body, db);
+  await sendToCustomer(phone, fromNumber, req.body.body, db, req.body.mediaUrl);
   res.json({ ok: true });
 });
 
