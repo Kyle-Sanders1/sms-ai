@@ -328,22 +328,24 @@ app.post('/api/call', async (req, res) => {
 });
 
 app.all('/webhook/call-bridge', (req, res) => {
-  // Phone numbers come from query string. URL-decode any encoded chars,
-  // and handle '+' being decoded to space.
-  let toRaw = req.query.to || req.body?.to || '';
-  let fromRaw = req.query.from || req.body?.from || '';
+  // Helper: pick first value if Express gave us an array (duplicate query+body)
+  const pick = v => Array.isArray(v) ? v[0] : (v || '');
 
-  // Replace spaces back to +
-  let to = toRaw.toString().replace(/ /g, '+');
-  let from = fromRaw.toString().replace(/ /g, '+');
+  // Get raw values, handling potential array from Express merging query+body
+  let toRaw = pick(req.query.to) || pick(req.body?.to) || '';
+  let fromRaw = pick(req.query.from) || pick(req.body?.from) || '';
 
-  // Sanitize: keep only digits and a single leading +
-  to = to.replace(/[^+\d]/g, '');
-  from = from.replace(/[^+\d]/g, '');
-  if (!to.startsWith('+')) to = '+' + to;
-  if (!from.startsWith('+')) from = '+' + from;
+  // Convert space back to + (URL form encoding decodes + as space)
+  let to = String(toRaw).replace(/ /g, '+');
+  let from = String(fromRaw).replace(/ /g, '+');
 
-  console.log('[call-bridge] dialing', JSON.stringify({to, from, raw: {toRaw, fromRaw}}));
+  // Sanitize: keep only digits, then prepend single +
+  to = to.replace(/[^\d]/g, '');
+  from = from.replace(/[^\d]/g, '');
+  if (to) to = '+' + to;
+  if (from) from = '+' + from;
+
+  console.log('[call-bridge] FINAL', JSON.stringify({to, from, rawQuery: req.query, rawBody: req.body}));
 
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, 'Connecting you now.');
@@ -355,7 +357,7 @@ app.all('/webhook/call-bridge', (req, res) => {
   });
   dial.number(to);
   const xml = twiml.toString();
-  console.log('[call-bridge] TwiML:', xml);
+  console.log('[call-bridge] TwiML output:', xml);
   res.type('text/xml').send(xml);
 });
 
