@@ -48,6 +48,14 @@ const ROOF_NUMBER        = process.env.ROOF_NUMBER;   // +13527178774
 const LIGHTS_NUMBER      = process.env.LIGHTS_NUMBER; // +13214789627
 const AUTO_SEND_SECONDS  = parseInt(process.env.AUTO_SEND_SECONDS || '60');
 
+// Bridge to the custom-crm app — see /api/external/send and the inbound forwarder
+// in /webhook/inbound. CRM_API_KEY auths CRM→Hub send requests; CRM_WEBHOOK_URL +
+// CRM_WEBHOOK_SECRET let the Hub forward inbound SMS to the CRM. All optional —
+// missing values disable just that direction without breaking standalone SMS Hub use.
+const CRM_API_KEY        = process.env.CRM_API_KEY || '';
+const CRM_WEBHOOK_URL    = process.env.CRM_WEBHOOK_URL || '';
+const CRM_WEBHOOK_SECRET = process.env.CRM_WEBHOOK_SECRET || '';
+
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const anthropic    = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
@@ -490,6 +498,25 @@ async function sendToCustomer(customerPhone, fromNumber, body, db, mediaUrl) {
   }
 }
 
+// Fire-and-forget POST to the CRM webhook so inbound texts also appear there.
+// Wrapped in setImmediate to never block the Twilio response or the local DB write.
+function forwardInboundToCRM(fromPhone, toNumber, body) {
+  if (!CRM_WEBHOOK_URL) return; // bridge disabled
+  setImmediate(async () => {
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (CRM_WEBHOOK_SECRET) headers['X-Webhook-Secret'] = CRM_WEBHOOK_SECRET;
+      const r = await fetch(CRM_WEBHOOK_URL, {
+        method: 'POST', headers,
+        body: JSON.stringify({ from: fromPhone, to: toNumber, body }),
+      });
+      if (!r.ok) console.warn(`[crm forward] ${r.status} ${await r.text().catch(() => '')}`.slice(0, 200));
+    } catch (e) {
+      console.warn('[crm forward] error:', e.message);
+    }
+  });
+}
+
 // ── Inbound SMS from customers ───────────────────────────────────────────────
 app.post('/webhook/inbound', async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
@@ -499,6 +526,9 @@ app.post('/webhook/inbound', async (req, res) => {
     const fromPhone  = req.body.From;  // customer's number
     const toNumber   = req.body.To;    // which Twilio number they texted
     const body       = req.body.Body || '';
+
+    // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion)
+    forwardInboundToCRM(fromPhone, toNumber, body);
 
     // Collect any inbound media URLs from Twilio
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
@@ -844,6 +874,41 @@ app.all('/webhook/voice-after-kyle', (req, res) => {
   }
 
   res.type('text/xml').send(twiml.toString());
+});
+
+// ── External-app SMS bridge (used by the custom-crm app) ────────────────────
+// POST /api/external/send  { to: "+1...", body: "...", from?: "+1..." }
+// Header: X-Api-Key: <CRM_API_KEY>
+// Defaults `from` to ROOF_NUMBER. Creates a customer record locally so the
+// conversation also appears in the SMS Hub dashboard. Returns {ok, phone, sid?}.
+app.post('/api/external/send', async (req, res) => {
+  try {
+    if (!CRM_API_KEY) return res.status(503).json({ error: 'CRM bridge not configured (CRM_API_KEY unset)' });
+    const provided = req.headers['x-api-key'] || '';
+    if (provided !== CRM_API_KEY) return res.status(401).json({ error: 'Invalid X-Api-Key' });
+    const { to, body, from, mediaUrl } = req.body || {};
+    if (!to || !body) return res.status(400).json({ error: 'to and body required' });
+    let phone = String(to).replace(/\D/g, '');
+    if (phone.length === 10) phone = '+1' + phone;
+    else if (!String(to).startsWith('+')) phone = '+' + phone;
+    else phone = String(to);
+    const fromNumber = from || ROOF_NUMBER;
+    const businessLine = fromNumber === ROOF_NUMBER ? '🏠 ROOF (352)' : '💡 LIGHTS (321)';
+    const db = loadDB();
+    if (!db.customers[phone]) {
+      db.customers[phone] = {
+        phone, name: null, line: businessLine,
+        firstContact: new Date().toISOString(),
+        lastContact: new Date().toISOString(),
+        messages: [], source: 'crm',
+      };
+    }
+    await sendToCustomer(phone, fromNumber, body, db, mediaUrl);
+    res.json({ ok: true, phone, from: fromNumber });
+  } catch (err) {
+    console.error('[external/send] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: send new SMS to any number
