@@ -500,7 +500,7 @@ async function sendToCustomer(customerPhone, fromNumber, body, db, mediaUrl) {
 
 // Fire-and-forget POST to the CRM webhook so inbound texts also appear there.
 // Wrapped in setImmediate to never block the Twilio response or the local DB write.
-function forwardInboundToCRM(fromPhone, toNumber, body) {
+function forwardInboundToCRM(fromPhone, toNumber, body, media) {
   if (!CRM_WEBHOOK_URL) return; // bridge disabled
   setImmediate(async () => {
     try {
@@ -508,7 +508,7 @@ function forwardInboundToCRM(fromPhone, toNumber, body) {
       if (CRM_WEBHOOK_SECRET) headers['X-Webhook-Secret'] = CRM_WEBHOOK_SECRET;
       const r = await fetch(CRM_WEBHOOK_URL, {
         method: 'POST', headers,
-        body: JSON.stringify({ from: fromPhone, to: toNumber, body }),
+        body: JSON.stringify({ from: fromPhone, to: toNumber, body, media: media || [] }),
       });
       if (!r.ok) console.warn(`[crm forward] ${r.status} ${await r.text().catch(() => '')}`.slice(0, 200));
     } catch (e) {
@@ -527,9 +527,6 @@ app.post('/webhook/inbound', async (req, res) => {
     const toNumber   = req.body.To;    // which Twilio number they texted
     const body       = req.body.Body || '';
 
-    // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion)
-    forwardInboundToCRM(fromPhone, toNumber, body);
-
     // Collect any inbound media URLs from Twilio
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
     const incomingMedia = [];
@@ -537,6 +534,10 @@ app.post('/webhook/inbound', async (req, res) => {
       const url = req.body[`MediaUrl${i}`];
       if (url) incomingMedia.push(url);
     }
+
+    // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion).
+    // The CRM also copies it into the Go High Level inbox, pictures included.
+    forwardInboundToCRM(fromPhone, toNumber, body, incomingMedia);
 
     const businessLine = toNumber === ROOF_NUMBER
       ? '🏠 ROOF (352)'
