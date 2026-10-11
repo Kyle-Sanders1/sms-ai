@@ -26,6 +26,34 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+// ── Access control ───────────────────────────────────────────────────────────
+// Twilio webhooks, the CRM bridge (X-Api-Key) and the PWA files stay open.
+// Set DASHBOARD_PASSWORD (+ optional DASHBOARD_USER, default "kyle") to put the
+// dashboard and its APIs behind a browser password prompt.
+const OPEN_PATHS = [/^\/webhook\//, /^\/api\/external\//, /^\/uploads\//, /^\/(sw\.js|manifest\.json|icon\.png)$/];
+function apiKeyOk(req) {
+  const key = process.env.CRM_API_KEY || '';
+  return !!key && (req.headers['x-api-key'] || '') === key;
+}
+function dashboardAuthOk(req) {
+  const pass = process.env.DASHBOARD_PASSWORD || '';
+  if (!pass) return false;
+  const m = /^Basic (.+)$/.exec(req.headers.authorization || '');
+  if (!m) return false;
+  const [u, ...rest] = Buffer.from(m[1], 'base64').toString('utf8').split(':');
+  return u === (process.env.DASHBOARD_USER || 'kyle') && rest.join(':') === pass;
+}
+app.use((req, res, next) => {
+  if (!process.env.DASHBOARD_PASSWORD || OPEN_PATHS.some(r => r.test(req.path)) || apiKeyOk(req)) return next();
+  if (dashboardAuthOk(req)) return next();
+  res.set('WWW-Authenticate', 'Basic realm="SMS Hub"').status(401).send('Password required');
+});
+// Placing calls from the business lines always needs the CRM key or the dashboard password.
+function requireCallAuth(req, res, next) {
+  if (apiKeyOk(req) || dashboardAuthOk(req)) return next();
+  res.status(401).json({ error: 'X-Api-Key required' });
+}
+
 // Serve uploaded media publicly so Twilio can fetch
 app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
 
@@ -55,6 +83,18 @@ const AUTO_SEND_SECONDS  = parseInt(process.env.AUTO_SEND_SECONDS || '60');
 const CRM_API_KEY        = process.env.CRM_API_KEY || '';
 const CRM_WEBHOOK_URL    = process.env.CRM_WEBHOOK_URL || '';
 const CRM_WEBHOOK_SECRET = process.env.CRM_WEBHOOK_SECRET || '';
+// CRM base for call lookups (defaults to the origin of CRM_WEBHOOK_URL).
+const CRM_BASE_URL = (process.env.CRM_BASE_URL || (CRM_WEBHOOK_URL ? new URL(CRM_WEBHOOK_URL).origin : '')).replace(/\/$/, '');
+// GHL Conversation AI answers texts once the lines are in GHL — set AI_AUTO_REPLY=off
+// so this hub stops auto-sending its own suggested replies (they'd double up).
+const AI_AUTO_REPLY = (process.env.AI_AUTO_REPLY || 'on').toLowerCase() !== 'off';
+// New call flow (whisper + press 1, 12s unknown → Vapi, 20s customer → voicemail).
+// Off = the original 7-second ring then Vapi, exactly as before.
+const CALL_SCREENING = (process.env.CALL_SCREENING || '') === '1';
+const RING_UNKNOWN_SECONDS = parseInt(process.env.RING_UNKNOWN_SECONDS || '12');
+const RING_CUSTOMER_SECONDS = parseInt(process.env.RING_CUSTOMER_SECONDS || '20');
+const VOICEMAIL_GREETING = process.env.VOICEMAIL_GREETING ||
+  "Sorry we missed your call. Please leave a message after the tone and we'll get right back to you.";
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const anthropic    = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
@@ -500,7 +540,7 @@ async function sendToCustomer(customerPhone, fromNumber, body, db, mediaUrl) {
 
 // Fire-and-forget POST to the CRM webhook so inbound texts also appear there.
 // Wrapped in setImmediate to never block the Twilio response or the local DB write.
-function forwardInboundToCRM(fromPhone, toNumber, body) {
+function forwardInboundToCRM(fromPhone, toNumber, body, media) {
   if (!CRM_WEBHOOK_URL) return; // bridge disabled
   setImmediate(async () => {
     try {
@@ -508,7 +548,7 @@ function forwardInboundToCRM(fromPhone, toNumber, body) {
       if (CRM_WEBHOOK_SECRET) headers['X-Webhook-Secret'] = CRM_WEBHOOK_SECRET;
       const r = await fetch(CRM_WEBHOOK_URL, {
         method: 'POST', headers,
-        body: JSON.stringify({ from: fromPhone, to: toNumber, body }),
+        body: JSON.stringify({ from: fromPhone, to: toNumber, body, media: media || [] }),
       });
       if (!r.ok) console.warn(`[crm forward] ${r.status} ${await r.text().catch(() => '')}`.slice(0, 200));
     } catch (e) {
@@ -527,9 +567,6 @@ app.post('/webhook/inbound', async (req, res) => {
     const toNumber   = req.body.To;    // which Twilio number they texted
     const body       = req.body.Body || '';
 
-    // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion)
-    forwardInboundToCRM(fromPhone, toNumber, body);
-
     // Collect any inbound media URLs from Twilio
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
     const incomingMedia = [];
@@ -537,6 +574,10 @@ app.post('/webhook/inbound', async (req, res) => {
       const url = req.body[`MediaUrl${i}`];
       if (url) incomingMedia.push(url);
     }
+
+    // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion).
+    // The CRM also copies it into the Go High Level inbox, pictures included.
+    forwardInboundToCRM(fromPhone, toNumber, body, incomingMedia);
 
     const businessLine = toNumber === ROOF_NUMBER
       ? '🏠 ROOF (352)'
@@ -577,6 +618,13 @@ app.post('/webhook/inbound', async (req, res) => {
     // If customer is blocked, do NOT generate AI reply or notify
     if (db.customers[fromPhone].blocked) {
       console.log(`Inbound from blocked number ${fromPhone} — skipping AI reply`);
+      return;
+    }
+
+    // Replies are handled in Go High Level now — keep the message, skip the auto-reply.
+    if (!AI_AUTO_REPLY) {
+      broadcastSSE({ type: 'new_message', customerPhone: fromPhone,
+        customerName: db.customers[fromPhone]?.name || fromPhone, businessLine, message: body, suggestedReply: '' });
       return;
     }
 
@@ -776,11 +824,12 @@ app.post('/api/customer/:phone/message/:idx/delete', (req, res) => {
 });
 
 // API: call customer (bridge call through Twilio)
-app.post('/api/call', async (req, res) => {
+app.post('/api/call', requireCallAuth, async (req, res) => {
   try {
     const { customerPhone, fromNumber } = req.body;
+    if (![ROOF_NUMBER, LIGHTS_NUMBER].includes(fromNumber)) return res.status(400).json({ error: 'fromNumber must be one of the business lines' });
     await twilioClient.calls.create({
-      to: KYLE_PHONE, from: fromNumber,
+      to: KYLE_PHONE, from: fromNumber, timeout: 18, // ring Kyle's cell; stop before his voicemail grabs it
       url: req.protocol + '://' + req.get('host') + '/webhook/call-bridge?to=' + encodeURIComponent(customerPhone) + '&from=' + encodeURIComponent(fromNumber)
     });
     res.json({ ok: true });
@@ -833,47 +882,156 @@ app.all('/webhook/call-bridge-done', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── INBOUND VOICE: Ring Kyle 7s, if no answer go to VAPI ─────────────────────
+// ── INBOUND VOICE ────────────────────────────────────────────────────────────
+// CALL_SCREENING off: ring Kyle 7s, then VAPI (original flow).
+// CALL_SCREENING=1:  caller ID on Kyle's phone is always the business line. When he
+//   answers he hears who it is and presses 1 to connect.
+//   - Unsaved caller: ring RING_UNKNOWN_SECONDS (12) → VAPI, same as before.
+//   - CRM customer:   ring RING_CUSTOMER_SECONDS (20) → voicemail (into GHL) + an
+//                     immediate "sorry I missed your call" text from that line.
 const VAPI_NUMBER = '+13526489684';
+// 321 may forward to a different Vapi number (VAPI_NUMBER_321) so Vapi leads keep their line.
+function vapiFor(line) {
+  return (line === LIGHTS_NUMBER && process.env.VAPI_NUMBER_321) ? process.env.VAPI_NUMBER_321 : VAPI_NUMBER;
+}
+function lineName(line) { return line === ROOF_NUMBER ? '3 5 2' : '3 2 1'; }
+function baseUrl(req) { return 'https://' + req.get('host'); }
 
-app.all('/webhook/voice-inbound', (req, res) => {
-  // Customer called Roof or Lights number → ring Kyle for 7s with action callback
+async function crmCall(method, path, body) {
+  if (!CRM_BASE_URL || !CRM_API_KEY) throw new Error('CRM_BASE_URL / CRM_API_KEY not set');
+  const r = await fetch(CRM_BASE_URL + path, {
+    method, signal: AbortSignal.timeout(method === 'GET' ? 2500 : 8000),
+    headers: { 'X-Api-Key': CRM_API_KEY, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`CRM ${r.status}`);
+  return r.json();
+}
+
+// Child-call SIDs where Kyle pressed 1 (pruned after 15 min)
+const acceptedLegs = new Map();
+function pruneAccepted() {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [sid, t] of acceptedLegs) if (t < cutoff) acceptedLegs.delete(sid);
+}
+
+app.all('/webhook/voice-inbound', async (req, res) => {
   const toNumber = req.body?.To || req.query?.To || '';
   const callerNumber = req.body?.From || req.query?.From || '';
-
-  console.log('[voice-inbound]', JSON.stringify({ toNumber, callerNumber }));
-
+  console.log('[voice-inbound]', JSON.stringify({ toNumber, callerNumber, screening: CALL_SCREENING }));
   const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!CALL_SCREENING) {
+    const dial = twiml.dial({
+      timeout: 7,
+      callerId: toNumber, // show Twilio biz number on Kyle's screen
+      action: '/webhook/voice-after-kyle?caller=' + encodeURIComponent(callerNumber),
+      method: 'POST'
+    });
+    dial.number(KYLE_PHONE);
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  let who = { known: false };
+  try { who = await crmCall('GET', '/api/twilio-lines/hub/caller?phone=' + encodeURIComponent(callerNumber) + '&line=' + encodeURIComponent(toNumber)); }
+  catch (e) { console.warn('[voice-inbound] caller lookup failed, treating as unsaved:', e.message); }
+
+  const msg = who.known
+    ? `${who.name || 'Customer'}, ${who.service ? who.service.toLowerCase() + ' ' : ''}customer, calling ${lineName(toNumber)}. Press 1 to connect.`
+    : `Unsaved contact calling ${lineName(toNumber)}. Press 1 to connect.`;
+  const q = new URLSearchParams({ caller: callerNumber, line: toNumber, known: who.known ? '1' : '0' });
   const dial = twiml.dial({
-    timeout: 7,
-    callerId: toNumber, // show Twilio biz number on Kyle's screen
-    action: '/webhook/voice-after-kyle?caller=' + encodeURIComponent(callerNumber),
+    timeout: who.known ? RING_CUSTOMER_SECONDS : RING_UNKNOWN_SECONDS,
+    callerId: toNumber,              // Kyle always sees 321 / 352
+    action: '/webhook/voice-after-kyle?' + q.toString(),
     method: 'POST'
   });
-  dial.number(KYLE_PHONE);
+  dial.number({ url: '/webhook/whisper?msg=' + encodeURIComponent(msg), method: 'POST' }, KYLE_PHONE);
   res.type('text/xml').send(twiml.toString());
 });
 
-// After Kyle dial: if he answered, hang up everyone. If no answer, go to VAPI.
+// Plays to Kyle only, after he answers (the caller keeps hearing ringing).
+app.all('/webhook/whisper', (req, res) => {
+  const msg = String(req.query?.msg || 'Incoming call. Press 1 to connect.');
+  const twiml = new twilio.twiml.VoiceResponse();
+  const g = twiml.gather({ numDigits: 1, timeout: 6, action: '/webhook/whisper-accept', method: 'POST' });
+  g.say({ voice: 'Polly.Joanna' }, msg);
+  g.pause({ length: 1 });
+  g.say({ voice: 'Polly.Joanna' }, msg);
+  twiml.hangup(); // no key (or his voicemail picked up) → treat as not answered
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.all('/webhook/whisper-accept', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  if ((req.body?.Digits || '') === '1') {
+    pruneAccepted();
+    acceptedLegs.set(req.body?.CallSid || '', Date.now());
+    // empty response → the two calls are bridged
+  } else {
+    twiml.hangup();
+  }
+  res.type('text/xml').send(twiml.toString());
+});
+
+// After the Kyle leg ends.
 app.all('/webhook/voice-after-kyle', (req, res) => {
   const dialStatus = req.body?.DialCallStatus || '';
+  const callStatus = req.body?.CallStatus || '';
   const caller = req.query?.caller || req.body?.caller || '';
+  const line = req.query?.line || '';
+  const known = req.query?.known === '1';
+  const answered = CALL_SCREENING
+    ? acceptedLegs.has(req.body?.DialCallSid || '')
+    : (dialStatus === 'completed' || dialStatus === 'answered');
 
-  console.log('[voice-after-kyle]', JSON.stringify({ dialStatus, caller }));
-
+  console.log('[voice-after-kyle]', JSON.stringify({ dialStatus, callStatus, caller, line, known, answered }));
   const twiml = new twilio.twiml.VoiceResponse();
 
-  // If Kyle answered the call, just hang up (the dial already ended naturally)
-  if (dialStatus === 'completed' || dialStatus === 'answered') {
+  if (answered) {
     twiml.hangup();
+  } else if (CALL_SCREENING && known) {
+    // Customer: immediate text from the line they called, then voicemail.
+    crmCall('POST', '/api/twilio-lines/hub/missed-call', { caller, line })
+      .catch(e => console.warn('[missed-call] CRM error:', e.message));
+    if (callStatus !== 'completed') { // caller is still on the line
+      twiml.say({ voice: 'Polly.Joanna' }, VOICEMAIL_GREETING);
+      const q = new URLSearchParams({ caller, line });
+      twiml.record({
+        maxLength: 180, playBeep: true, trim: 'trim-silence',
+        action: '/webhook/voicemail-done',
+        recordingStatusCallback: baseUrl(req) + '/webhook/voicemail-ready?' + q.toString(),
+        recordingStatusCallbackEvent: 'completed',
+      });
+    }
   } else {
-    // Kyle didn't answer (no-answer, busy, failed) — forward to VAPI
+    // Unsaved caller (or old flow) — forward to VAPI exactly as before.
     // Pass the original caller number through callerId so VAPI sees who's calling
     const dial = twiml.dial({ callerId: caller });
-    dial.number(VAPI_NUMBER);
+    dial.number(CALL_SCREENING ? vapiFor(line) : VAPI_NUMBER);
   }
-
   res.type('text/xml').send(twiml.toString());
+});
+
+app.all('/webhook/voicemail-done', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.say({ voice: 'Polly.Joanna' }, 'Thanks, talk soon.');
+  twiml.hangup();
+  res.type('text/xml').send(twiml.toString());
+});
+
+// Twilio → recording finished → CRM puts it in the customer's GHL conversation.
+app.all('/webhook/voicemail-ready', async (req, res) => {
+  res.sendStatus(204);
+  const b = req.body || {};
+  if ((b.RecordingStatus || 'completed') !== 'completed' || !b.RecordingUrl) return;
+  if (parseInt(b.RecordingDuration || '0', 10) < 2) return; // hang-up, no message
+  try {
+    await crmCall('POST', '/api/twilio-lines/hub/voicemail', {
+      caller: req.query?.caller || '', line: req.query?.line || '',
+      recording_url: b.RecordingUrl, duration: parseInt(b.RecordingDuration || '0', 10),
+    });
+  } catch (e) { console.warn('[voicemail-ready] CRM error:', e.message); }
 });
 
 // ── External-app SMS bridge (used by the custom-crm app) ────────────────────
@@ -930,9 +1088,10 @@ app.post('/api/new-sms', async (req, res) => {
 });
 
 // API: new outbound call to any number
-app.post('/api/new-call', async (req, res) => {
+app.post('/api/new-call', requireCallAuth, async (req, res) => {
   try {
     const { toPhone, fromNumber } = req.body;
+    if (![ROOF_NUMBER, LIGHTS_NUMBER].includes(fromNumber)) return res.status(400).json({ error: 'fromNumber must be one of the business lines' });
     let phone = toPhone.replace(/\D/g,'');
     if (phone.length === 10) phone = '+1' + phone;
     else if (!phone.startsWith('+')) phone = '+' + phone;
