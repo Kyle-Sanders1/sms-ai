@@ -30,7 +30,7 @@ app.use(express.json());
 // Twilio webhooks, the CRM bridge (X-Api-Key) and the PWA files stay open.
 // Set DASHBOARD_PASSWORD (+ optional DASHBOARD_USER, default "kyle") to put the
 // dashboard and its APIs behind a browser password prompt.
-const OPEN_PATHS = [/^\/webhook\//, /^\/api\/external\//, /^\/uploads\//, /^\/(sw\.js|manifest\.json|icon\.png)$/];
+const OPEN_PATHS = [/^\/webhook\//, /^\/api\/external\//, /^\/uploads\//, /^\/twilio-media\//, /^\/(sw\.js|manifest\.json|icon\.png)$/];
 function apiKeyOk(req) {
   const key = process.env.CRM_API_KEY || '';
   return !!key && (req.headers['x-api-key'] || '') === key;
@@ -56,6 +56,33 @@ function requireCallAuth(req, res, next) {
 
 // Serve uploaded media publicly so Twilio can fetch
 app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
+
+// ── Twilio media relay ───────────────────────────────────────────────────────
+// Twilio requires the account's API keys to open MMS photos and call recordings, so a
+// raw api.twilio.com link (in GHL, the CRM, a text) pops a login box. This relays the
+// same path with our keys: https://<hub>/twilio-media/2010-04-01/Accounts/AC…/Messages/MM…/Media/ME…
+// Only this account's message media and recordings; the 34-char SIDs are unguessable.
+const MEDIA_PATH = /^2010-04-01\/Accounts\/(AC[0-9a-f]{32})\/(Messages\/(MM|SM)[0-9a-f]{32}\/Media\/ME[0-9a-f]{32}|Recordings\/RE[0-9a-f]{32}(\.(mp3|wav))?)$/;
+app.get('/twilio-media/*', async (req, res) => {
+  const rel = req.params[0] || '';
+  const m = rel.match(MEDIA_PATH);
+  if (!m || m[1] !== TWILIO_ACCOUNT_SID) return res.status(404).send('Not found');
+  try {
+    const auth = 'Basic ' + Buffer.from(TWILIO_ACCOUNT_SID + ':' + TWILIO_AUTH_TOKEN).toString('base64');
+    const r = await fetch('https://api.twilio.com/' + rel, { headers: { Authorization: auth }, redirect: 'follow' });
+    if (!r.ok) return res.status(r.status === 404 ? 404 : 502).send('Media unavailable');
+    res.set('Content-Type', r.headers.get('content-type') || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=86400');
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    console.warn('[twilio-media]', e.message);
+    res.status(502).send('Media unavailable');
+  }
+});
+function publicMediaUrl(req, url) {
+  const m = String(url || '').match(/^https:\/\/api\.twilio\.com\/(2010-04-01\/Accounts\/.+)$/);
+  return m ? baseUrl(req) + '/twilio-media/' + m[1] : url;
+}
 
 // Upload endpoint — receives a file, returns a public URL
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -577,7 +604,7 @@ app.post('/webhook/inbound', async (req, res) => {
 
     // Mirror to CRM (fire-and-forget; won't block local processing or AI suggestion).
     // The CRM also copies it into the Go High Level inbox, pictures included.
-    forwardInboundToCRM(fromPhone, toNumber, body, incomingMedia);
+    forwardInboundToCRM(fromPhone, toNumber, body, incomingMedia.map(u => publicMediaUrl(req, u)));
 
     const businessLine = toNumber === ROOF_NUMBER
       ? '🏠 ROOF (352)'
@@ -1049,7 +1076,7 @@ app.all('/webhook/voicemail-ready', async (req, res) => {
   try {
     await crmCall('POST', '/api/twilio-lines/hub/voicemail', {
       caller: req.query?.caller || '', line: req.query?.line || '',
-      recording_url: b.RecordingUrl, duration: parseInt(b.RecordingDuration || '0', 10),
+      recording_url: publicMediaUrl(req, b.RecordingUrl), duration: parseInt(b.RecordingDuration || '0', 10),
     });
   } catch (e) { console.warn('[voicemail-ready] CRM error:', e.message); }
 });
