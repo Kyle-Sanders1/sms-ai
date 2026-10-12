@@ -1007,9 +1007,29 @@ app.all('/webhook/voice-after-kyle', (req, res) => {
   } else {
     // Unsaved caller (or old flow) — forward to VAPI exactly as before.
     // Pass the original caller number through callerId so VAPI sees who's calling
-    const dial = twiml.dial({ callerId: caller });
+    const opts = { callerId: caller };
+    if (CALL_SCREENING) {
+      // When the Vapi leg ends, tell the CRM: an unfinished intake gets Kyle's follow-up text.
+      opts.action = '/webhook/vapi-ended?' + new URLSearchParams({ caller, line }).toString();
+      opts.method = 'POST';
+    }
+    const dial = twiml.dial(opts);
     dial.number(CALL_SCREENING ? vapiFor(line) : VAPI_NUMBER);
   }
+  res.type('text/xml').send(twiml.toString());
+});
+
+// After the Vapi leg ends (unknown callers only). The CRM waits a few minutes for the
+// Vapi → Zapier quote lead, then texts Kyle's follow-up if the intake didn't finish.
+app.all('/webhook/vapi-ended', (req, res) => {
+  const caller = req.query?.caller || '';
+  const line = req.query?.line || '';
+  const seconds = parseInt(req.body?.DialCallDuration || '0', 10);
+  console.log('[vapi-ended]', JSON.stringify({ caller, line, seconds, status: req.body?.DialCallStatus }));
+  crmCall('POST', '/api/twilio-lines/hub/vapi-ended', { caller, line, seconds })
+    .catch(e => console.warn('[vapi-ended] CRM error:', e.message));
+  const twiml = new twilio.twiml.VoiceResponse();
+  twiml.hangup();
   res.type('text/xml').send(twiml.toString());
 });
 
